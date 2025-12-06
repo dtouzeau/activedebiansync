@@ -1,0 +1,42 @@
+{
+  "sync_interval": 360,
+  "sync_packages": true,
+  "repository_path": "/var/lib/ActiveDebianSync/mirror",
+  "debian_mirror": "http://deb.debian.org/debian",
+  "sync_debian_installer": false,
+  "sync_installer_udebs": false,
+  "sync_installer_images": false,
+  "installer_image_types": ["netboot", "hd-media", "cdrom"],
+  "debian_releases": [
+    "bookworm",
+    "bookworm-updates",
+    "bookworm-security",
+    "trixie"
+  ],
+  "debian_architectures": [
+    "amd64",
+    "arm64"
+  ],
+  "debian_components": [
+    "main",
+    "contrib",
+    "non-free",
+    "non-free-firmware"
+  ],
+  "http_enabled": true,
+  "http_port": 8080,
+  "https_enabled": true,
+  "https_port": 8443,
+  "tls_cert_file": "/etc/ActiveDebianSync/server.crt",
+  "tls_key_file": "/etc/ActiveDebianSync/server.key",
+  "api_enabled": true,
+  "api_port": 9090,
+  "api_listen_addr": "0.0.0.0",
+  "api_allowed_ips": [
+    "192.168.0.0/16",
+    "10.0.0.5"
+  ],
+  "max_disk_usage_percent": 85,
+  "log_path": "/var/log/ActiveDebianSync/sync.log",
+  "access_log_path": "/var/log/ActiveDebianSync/access.log"
+}

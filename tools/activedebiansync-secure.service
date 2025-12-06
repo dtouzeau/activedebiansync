@@ -1,0 +1,40 @@
+[Unit]
+    Description=ActiveDebianSync - Debian Repository Synchronization Daemon
+    After=network-online.target
+    Wants=network-online.target
+
+[Service]
+    Type=simple
+    User=root
+    Group=root
+    ExecStart=/usr/local/bin/activedebiansync -config /etc/ActiveDebianSync/config.json
+    Restart=on-failure
+    RestartSec=10s
+    StartLimitBurst=5
+    StartLimitIntervalSec=300
+    LimitNOFILE=65536
+    MemoryMax=4G
+    TasksMax=512
+    NoNewPrivileges=false
+    PrivateTmp=true
+    ProtectSystem=strict
+    ProtectHome=true
+    ProtectKernelTunables=true
+    ProtectControlGroups=true
+    RestrictRealtime=true
+    RestrictNamespaces=true
+    ReadWritePaths=/var/lib/ActiveDebianSync
+    ReadWritePaths=/var/log/ActiveDebianSync
+    ReadWritePaths=/etc/ActiveDebianSync
+    ReadWritePaths=/var/run/ActiveDebianSync
+    StandardOutput=journal
+    StandardError=journal
+    SyslogIdentifier=activedebiansync
+    TimeoutStopSec=60s
+    KillMode=mixed
+    KillSignal=SIGTERM
+    FinalKillSignal=SIGKILL
+    Environment="GOMAXPROCS=4"
+
+[Install]
+    WantedBy=multi-user.target
