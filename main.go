@@ -11,6 +11,7 @@ import (
 	"activedebiansync/server"
 	"activedebiansync/sync"
 	"activedebiansync/utils"
+	"activedebiansync/webconsole"
 	"context"
 	"flag"
 	"fmt"
@@ -275,10 +276,31 @@ func startDaemon() {
 		}
 	}()
 
+	// Initialiser et démarrer la console web (si activée)
+	var webConsole *webconsole.WebConsole
+	if cfgData.WebConsoleEnabled {
+		var err error
+		webConsole, err = webconsole.NewWebConsole(cfg, *configPath, logger)
+		if err != nil {
+			logger.LogError("Failed to initialize web console: %v", err)
+			logger.LogError("Web console will be disabled")
+		} else {
+			// Set providers for the web console
+			webConsole.SetProviders(httpServer, syncer, pkgManager)
+
+			go func() {
+				if err := webConsole.Start(ctx); err != nil {
+					errChan <- fmt.Errorf("Web Console error: %w", err)
+				}
+			}()
+		}
+	}
+
 	logger.LogInfo("All services started successfully")
 	logger.LogInfo("HTTP Server: %v (port %d)", cfgData.HTTPEnabled, cfgData.HTTPPort)
 	logger.LogInfo("HTTPS Server: %v (port %d)", cfgData.HTTPSEnabled, cfgData.HTTPSPort)
 	logger.LogInfo("REST API: %v (%s:%d)", cfgData.APIEnabled, cfgData.APIListenAddr, cfgData.APIPort)
+	logger.LogInfo("Web Console: %v (%s:%d)", cfgData.WebConsoleEnabled, cfgData.WebConsoleListenAddr, cfgData.WebConsolePort)
 	logger.LogInfo("Repository Path: %s", cfgData.RepositoryPath)
 	logger.LogInfo("Sync Interval: %d minutes", cfgData.SyncInterval)
 
