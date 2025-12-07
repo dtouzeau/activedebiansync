@@ -4,7 +4,7 @@
 
 ActiveDebianSync combines repository mirroring, HTTP serving, REST API, and monitoring into a single binary with zero external dependencies.
 
-<img src="https://wiki.articatech.com/screen.png" width="550">
+<img src="https://wiki.articatech.com/screen.png" width="750">
 
 
 For documentation about **installing** and **managing**, see :
