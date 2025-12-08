@@ -265,7 +265,16 @@ func (s *Syncer) Sync() error {
 
 	// Synchroniser chaque release
 	for _, release := range cfg.DebianReleases {
-		for _, component := range cfg.DebianComponents {
+		// Get release-specific configuration
+		releaseConfig := s.config.GetReleaseConfig(release)
+
+		// Determine components to sync for this release
+		components := cfg.DebianComponents
+		if len(releaseConfig.Components) > 0 {
+			components = releaseConfig.Components
+		}
+
+		for _, component := range components {
 			for _, arch := range cfg.DebianArchs {
 				if err := s.syncReleaseComponent(release, component, arch); err != nil {
 					s.logger.LogError("Failed to sync %s/%s/%s: %v", release, component, arch, err)
@@ -293,6 +302,12 @@ func (s *Syncer) Sync() error {
 					break
 				}
 			}
+		}
+
+		// Sync additional suites for this release (-updates, -backports, security)
+		if err := s.syncAdditionalSuites(release, releaseConfig, components); err != nil {
+			s.logger.LogError("Failed to sync additional suites for %s: %v", release, err)
+			syncError = err
 		}
 	}
 
@@ -367,8 +382,29 @@ func (s *Syncer) Sync() error {
 func (s *Syncer) syncReleaseComponent(release, component, arch string) error {
 	cfg := s.config.Get()
 
-	// Obtenir le miroir actuel depuis le MirrorManager
-	mirrorURL := s.mirrorManager.GetCurrentMirror()
+	// Get release-specific configuration
+	releaseConfig := s.config.GetReleaseConfig(release)
+
+	// Check if this component is available for this release
+	if len(releaseConfig.Components) > 0 {
+		componentAvailable := false
+		for _, c := range releaseConfig.Components {
+			if c == component {
+				componentAvailable = true
+				break
+			}
+		}
+		if !componentAvailable {
+			s.logger.LogInfo("Component %s not available for archived release %s, skipping", component, release)
+			return nil
+		}
+	}
+
+	// Use release-specific mirror URL if configured, otherwise use MirrorManager
+	mirrorURL := releaseConfig.Mirror
+	if mirrorURL == "" {
+		mirrorURL = s.mirrorManager.GetCurrentMirror()
+	}
 	if mirrorURL == "" {
 		return fmt.Errorf("no mirror available")
 	}
@@ -435,18 +471,299 @@ func (s *Syncer) syncReleaseComponent(release, component, arch string) error {
 	return nil
 }
 
+// syncAdditionalSuites syncs -updates, -backports, and security suites for a release
+func (s *Syncer) syncAdditionalSuites(release string, releaseConfig config.ReleaseConfig, components []string) error {
+	cfg := s.config.Get()
+	var syncError error
+
+	// Sync -updates suite if enabled
+	if releaseConfig.SyncUpdates {
+		updatesSuite := release + "-updates"
+		s.logger.LogInfo("Syncing updates suite: %s", updatesSuite)
+		if err := s.syncSuite(releaseConfig.Mirror, updatesSuite, components, cfg.DebianArchs); err != nil {
+			s.logger.LogError("Failed to sync updates for %s: %v", release, err)
+			syncError = err
+		}
+	}
+
+	// Sync -backports suite if enabled
+	if releaseConfig.SyncBackports {
+		backportsSuite := release + "-backports"
+		s.logger.LogInfo("Syncing backports suite: %s", backportsSuite)
+		if err := s.syncSuite(releaseConfig.Mirror, backportsSuite, components, cfg.DebianArchs); err != nil {
+			s.logger.LogError("Failed to sync backports for %s: %v", release, err)
+			syncError = err
+		}
+	}
+
+	// Sync security suite if enabled
+	if releaseConfig.SyncSecurity {
+		securityMirror := releaseConfig.SecurityMirror
+		securitySuite := releaseConfig.SecuritySuite
+
+		if securityMirror != "" && securitySuite != "" {
+			s.logger.LogInfo("Syncing security suite: %s from %s", securitySuite, securityMirror)
+			if err := s.syncSecuritySuite(securityMirror, securitySuite, components, cfg.DebianArchs); err != nil {
+				s.logger.LogError("Failed to sync security for %s: %v", release, err)
+				syncError = err
+			}
+		}
+	}
+
+	return syncError
+}
+
+// syncSuite syncs a specific suite (e.g., bookworm-updates, bookworm-backports)
+func (s *Syncer) syncSuite(mirrorURL, suite string, components, architectures []string) error {
+	cfg := s.config.Get()
+
+	if mirrorURL == "" {
+		mirrorURL = s.mirrorManager.GetCurrentMirror()
+	}
+	if mirrorURL == "" {
+		return fmt.Errorf("no mirror available")
+	}
+
+	// Sync metadata for this suite
+	if err := s.syncSuiteMetadata(mirrorURL, suite); err != nil {
+		s.logger.LogError("Failed to sync metadata for suite %s: %v", suite, err)
+	}
+
+	// Sync each component/architecture
+	for _, component := range components {
+		for _, arch := range architectures {
+			if err := s.syncSuiteComponent(mirrorURL, suite, component, arch); err != nil {
+				s.logger.LogError("Failed to sync %s/%s/%s: %v", suite, component, arch, err)
+				continue
+			}
+
+			// Download packages if enabled
+			if cfg.SyncPackages {
+				if err := s.syncSuitePackages(mirrorURL, suite, component, arch); err != nil {
+					s.logger.LogError("Failed to sync packages for %s/%s/%s: %v", suite, component, arch, err)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// syncSecuritySuite syncs security updates from a separate mirror
+// For archived releases like buster, security is at debian-security with path like "buster/updates"
+// For current releases, security is at debian-security with path like "bookworm-security"
+func (s *Syncer) syncSecuritySuite(securityMirror, securitySuite string, components, architectures []string) error {
+	cfg := s.config.Get()
+
+	// Sync metadata for security suite
+	if err := s.syncSuiteMetadata(securityMirror, securitySuite); err != nil {
+		s.logger.LogError("Failed to sync security metadata for %s: %v", securitySuite, err)
+	}
+
+	// Sync each component/architecture
+	for _, component := range components {
+		for _, arch := range architectures {
+			if err := s.syncSuiteComponent(securityMirror, securitySuite, component, arch); err != nil {
+				s.logger.LogError("Failed to sync security %s/%s/%s: %v", securitySuite, component, arch, err)
+				continue
+			}
+
+			// Download packages if enabled
+			if cfg.SyncPackages {
+				if err := s.syncSuitePackages(securityMirror, securitySuite, component, arch); err != nil {
+					s.logger.LogError("Failed to sync security packages for %s/%s/%s: %v", securitySuite, component, arch, err)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// syncSuiteMetadata downloads Release, Release.gpg, InRelease files for a suite
+func (s *Syncer) syncSuiteMetadata(mirrorURL, suite string) error {
+	cfg := s.config.Get()
+
+	remoteBase := fmt.Sprintf("%s/dists/%s", mirrorURL, suite)
+	localBase := filepath.Join(cfg.RepositoryPath, "dists", suite)
+
+	if err := os.MkdirAll(localBase, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", localBase, err)
+	}
+
+	metadataFiles := []string{"Release", "Release.gpg", "InRelease"}
+	for _, file := range metadataFiles {
+		remoteURL := fmt.Sprintf("%s/%s", remoteBase, file)
+		localPath := filepath.Join(localBase, file)
+
+		if err := s.downloadFileResume(remoteURL, localPath); err != nil {
+			// Some files may not exist (e.g., Release.gpg for some suites)
+			if file != "Release.gpg" {
+				s.logger.LogError("Failed to download %s/%s: %v", suite, file, err)
+			}
+			continue
+		}
+		s.logger.LogSync("Downloaded metadata: %s/%s", suite, file)
+	}
+
+	return nil
+}
+
+// syncSuiteComponent downloads Packages index files for a suite component
+func (s *Syncer) syncSuiteComponent(mirrorURL, suite, component, arch string) error {
+	cfg := s.config.Get()
+
+	remoteBase := fmt.Sprintf("%s/dists/%s/%s", mirrorURL, suite, component)
+	localBase := filepath.Join(cfg.RepositoryPath, "dists", suite, component)
+
+	// Create directory for binary-<arch>
+	binaryDir := filepath.Join(localBase, fmt.Sprintf("binary-%s", arch))
+	if err := os.MkdirAll(binaryDir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	// Download Packages index files
+	targets := []string{
+		fmt.Sprintf("binary-%s/Packages.gz", arch),
+		fmt.Sprintf("binary-%s/Packages.xz", arch),
+		fmt.Sprintf("binary-%s/Release", arch),
+	}
+
+	successCount := 0
+	for _, target := range targets {
+		remoteURL := fmt.Sprintf("%s/%s", remoteBase, target)
+		localPath := filepath.Join(localBase, target)
+
+		if err := s.downloadFileResume(remoteURL, localPath); err != nil {
+			// Packages.xz may not exist on older archives
+			if !strings.Contains(target, ".xz") {
+				s.logger.LogError("Failed to download %s/%s/%s: %v", suite, component, target, err)
+			}
+			continue
+		}
+		s.logger.LogSync("Downloaded: %s/%s/%s", suite, component, target)
+		successCount++
+	}
+
+	if successCount == 0 {
+		return fmt.Errorf("failed to download any index files for %s/%s/%s", suite, component, arch)
+	}
+
+	return nil
+}
+
+// syncSuitePackages downloads .deb packages for a suite based on its Packages index
+func (s *Syncer) syncSuitePackages(mirrorURL, suite, component, arch string) error {
+	cfg := s.config.Get()
+
+	// Find Packages file
+	packagesPath := filepath.Join(cfg.RepositoryPath, "dists", suite, component, fmt.Sprintf("binary-%s", arch), "Packages.gz")
+	if _, err := os.Stat(packagesPath); os.IsNotExist(err) {
+		packagesPath = filepath.Join(cfg.RepositoryPath, "dists", suite, component, fmt.Sprintf("binary-%s", arch), "Packages.xz")
+		if _, err := os.Stat(packagesPath); os.IsNotExist(err) {
+			s.logger.LogInfo("No Packages file found for %s/%s/%s, skipping package sync", suite, component, arch)
+			return nil
+		}
+	}
+
+	// Parse Packages file
+	packages, err := s.parsePackagesFile(packagesPath)
+	if err != nil {
+		return fmt.Errorf("failed to parse Packages file: %w", err)
+	}
+
+	if len(packages) == 0 {
+		s.logger.LogInfo("No packages found in %s/%s/%s", suite, component, arch)
+		return nil
+	}
+
+	s.logger.LogInfo("Found %d packages in %s/%s/%s", len(packages), suite, component, arch)
+
+	// Create download jobs
+	var jobs []DownloadJob
+	for _, pkg := range packages {
+		localPath := filepath.Join(cfg.RepositoryPath, pkg.Filename)
+
+		// Check if file already exists with correct size
+		if stat, err := os.Stat(localPath); err == nil {
+			if stat.Size() == pkg.Size {
+				continue
+			}
+		}
+
+		jobs = append(jobs, DownloadJob{
+			URL:                fmt.Sprintf("%s/%s", mirrorURL, pkg.Filename),
+			LocalPath:          localPath,
+			ReleaseName:        suite,
+			RelativePath:       pkg.Filename,
+			PackageName:        pkg.Package,
+			PackageVersion:     pkg.Version,
+			PackageDescription: pkg.Description,
+			PackageSize:        pkg.Size,
+			Component:          component,
+			Architecture:       arch,
+		})
+	}
+
+	if len(jobs) == 0 {
+		s.logger.LogInfo("All packages up to date for %s/%s/%s", suite, component, arch)
+		return nil
+	}
+
+	s.logger.LogInfo("Downloading %d packages for %s/%s/%s", len(jobs), suite, component, arch)
+
+	// Download in batches
+	batchSize := 100
+	for i := 0; i < len(jobs); i += batchSize {
+		end := i + batchSize
+		if end > len(jobs) {
+			end = len(jobs)
+		}
+
+		batch := jobs[i:end]
+		results := s.downloadFilesParallel(batch)
+
+		for _, result := range results {
+			if result.Error != nil {
+				s.logger.LogError("Failed to download %s: %v", result.Job.URL, result.Error)
+				atomic.AddInt64(&s.stats.FailedFiles, 1)
+			} else {
+				atomic.AddInt64(&s.stats.TotalFiles, 1)
+			}
+		}
+
+		// Check disk space
+		exceeded, _, err := utils.CheckDiskSpace(cfg.RepositoryPath, cfg.MaxDiskUsagePercent)
+		if err != nil {
+			s.logger.LogError("Failed to check disk space: %v", err)
+		}
+		if exceeded {
+			s.logger.LogError("Disk space limit reached during suite package sync, stopping")
+			return fmt.Errorf("disk space exceeded")
+		}
+	}
+
+	return nil
+}
+
 // syncMetadata synchronise les fichiers de métadonnées Release, InRelease, etc.
 func (s *Syncer) syncMetadata() {
 	cfg := s.config.Get()
 
-	// Obtenir le miroir actuel
-	mirrorURL := s.mirrorManager.GetCurrentMirror()
-	if mirrorURL == "" {
-		s.logger.LogError("No mirror available for metadata sync")
-		return
-	}
-
 	for _, release := range cfg.DebianReleases {
+		// Get release-specific configuration
+		releaseConfig := s.config.GetReleaseConfig(release)
+
+		// Use release-specific mirror URL if configured, otherwise use MirrorManager
+		mirrorURL := releaseConfig.Mirror
+		if mirrorURL == "" {
+			mirrorURL = s.mirrorManager.GetCurrentMirror()
+		}
+		if mirrorURL == "" {
+			s.logger.LogError("No mirror available for metadata sync")
+			return
+		}
+
 		remoteBase := fmt.Sprintf("%s/dists/%s", mirrorURL, release)
 		localBase := filepath.Join(cfg.RepositoryPath, "dists", release)
 
@@ -494,6 +811,19 @@ func (s *Syncer) syncMetadata() {
 			s.mirrorManager.MarkMirrorFailed(mirrorURL, fmt.Errorf("metadata sync failed for %s: %v", release, lastError))
 		} else if successCount > 0 && errorCount == 0 {
 			s.mirrorManager.MarkMirrorSuccess(mirrorURL)
+		}
+
+		// Sync metadata for additional suites (-updates, -backports, security)
+		if releaseConfig.SyncUpdates {
+			updatesSuite := release + "-updates"
+			_ = s.syncSuiteMetadata(mirrorURL, updatesSuite)
+		}
+		if releaseConfig.SyncBackports {
+			backportsSuite := release + "-backports"
+			_ = s.syncSuiteMetadata(mirrorURL, backportsSuite)
+		}
+		if releaseConfig.SyncSecurity && releaseConfig.SecurityMirror != "" && releaseConfig.SecuritySuite != "" {
+			_ = s.syncSuiteMetadata(releaseConfig.SecurityMirror, releaseConfig.SecuritySuite)
 		}
 	}
 }
@@ -965,8 +1295,14 @@ func (s *Syncer) syncPackages(release, component, arch string) error {
 
 	s.logger.LogInfo("Found %d packages in %s/%s/%s", len(packages), release, component, arch)
 
-	// Obtenir le miroir actuel
-	mirrorURL := s.mirrorManager.GetCurrentMirror()
+	// Get release-specific configuration
+	releaseConfig := s.config.GetReleaseConfig(release)
+
+	// Use release-specific mirror URL if configured, otherwise use MirrorManager
+	mirrorURL := releaseConfig.Mirror
+	if mirrorURL == "" {
+		mirrorURL = s.mirrorManager.GetCurrentMirror()
+	}
 	if mirrorURL == "" {
 		return fmt.Errorf("no mirror available")
 	}

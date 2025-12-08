@@ -12,19 +12,33 @@ const (
 	DefaultConfigPath = "/etc/ActiveDebianSync/config.json"
 )
 
+// ReleaseConfig represents configuration for a specific Debian release
+type ReleaseConfig struct {
+	Name           string   `json:"name"`                      // Release name: "buster", "bookworm", etc.
+	Mirror         string   `json:"mirror"`                    // Mirror URL for this release (overrides default)
+	SecurityMirror string   `json:"security_mirror,omitempty"` // Security mirror URL (for archive: http://archive.debian.org/debian-security)
+	SecuritySuite  string   `json:"security_suite,omitempty"`  // Security suite path (for archive: "buster/updates", for current: "bookworm-security")
+	IsArchived     bool     `json:"is_archived"`               // True if release is archived (uses archive.debian.org)
+	SyncUpdates    bool     `json:"sync_updates"`              // Sync -updates suite
+	SyncBackports  bool     `json:"sync_backports"`            // Sync -backports suite
+	SyncSecurity   bool     `json:"sync_security"`             // Sync security updates
+	Components     []string `json:"components,omitempty"`      // Override components for this release (e.g., no non-free-firmware for old releases)
+}
+
 // Config représente la configuration complète du démon
 type Config struct {
 	// Paramètres de synchronisation
-	SyncInterval         int      `json:"sync_interval"`          // En minutes
-	RepositoryPath       string   `json:"repository_path"`        // Chemin local du miroir
-	DebianMirror         string   `json:"debian_mirror"`          // URL du miroir source
-	DebianReleases       []string `json:"debian_releases"`        // ["bookworm", "trixie"]
-	DebianArchs          []string `json:"debian_architectures"`   // ["amd64", "arm64"]
-	DebianComponents     []string `json:"debian_components"`      // ["main", "contrib", "non-free", "non-free-firmware"]
-	SyncPackages         bool     `json:"sync_packages"`          // Télécharger les packages .deb (pas seulement les métadonnées)
-	SyncContents         bool     `json:"sync_contents"`          // Télécharger les fichiers Contents pour la recherche (comme apt-file)
-	PackageSearchEnabled bool     `json:"package_search_enabled"` // Activer la recherche de packages
-	ConfigPath           string   `json:"config_path"`
+	SyncInterval         int             `json:"sync_interval"`          // En minutes
+	RepositoryPath       string          `json:"repository_path"`        // Chemin local du miroir
+	DebianMirror         string          `json:"debian_mirror"`          // URL du miroir source (default)
+	DebianReleases       []string        `json:"debian_releases"`        // ["bookworm", "trixie"] - simple release list
+	DebianArchs          []string        `json:"debian_architectures"`   // ["amd64", "arm64"]
+	DebianComponents     []string        `json:"debian_components"`      // ["main", "contrib", "non-free", "non-free-firmware"]
+	ReleaseConfigs       []ReleaseConfig `json:"release_configs"`        // Advanced per-release configuration (optional)
+	SyncPackages         bool            `json:"sync_packages"`          // Télécharger les packages .deb (pas seulement les métadonnées)
+	SyncContents         bool            `json:"sync_contents"`          // Télécharger les fichiers Contents pour la recherche (comme apt-file)
+	PackageSearchEnabled bool            `json:"package_search_enabled"` // Activer la recherche de packages
+	ConfigPath           string          `json:"config_path"`
 
 	// Paramètres debian-installer (pour build-simple-cdd, netboot, etc.)
 	SyncDebianInstaller bool     `json:"sync_debian_installer"` // Activer la synchronisation debian-installer
@@ -279,4 +293,82 @@ func (c *Config) Update(fn func(*Config)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	fn(c)
+}
+
+// GetReleaseConfig returns the configuration for a specific release
+// If no specific config exists, returns a default config based on the release name
+func (c *Config) GetReleaseConfig(releaseName string) ReleaseConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// Check if there's a specific config for this release
+	for _, rc := range c.ReleaseConfigs {
+		if rc.Name == releaseName {
+			return rc
+		}
+	}
+
+	// Return default config for this release
+	return c.defaultReleaseConfig(releaseName)
+}
+
+// defaultReleaseConfig returns a default ReleaseConfig for a release
+func (c *Config) defaultReleaseConfig(releaseName string) ReleaseConfig {
+	// Known archived releases
+	archivedReleases := map[string]bool{
+		"buzz": true, "rex": true, "bo": true, "hamm": true, "slink": true,
+		"potato": true, "woody": true, "sarge": true, "etch": true,
+		"lenny": true, "squeeze": true, "wheezy": true, "jessie": true,
+		"stretch": true, "buster": true,
+	}
+
+	isArchived := archivedReleases[releaseName]
+
+	rc := ReleaseConfig{
+		Name:          releaseName,
+		Mirror:        c.DebianMirror,
+		IsArchived:    isArchived,
+		SyncUpdates:   true,
+		SyncBackports: false,
+		SyncSecurity:  true,
+		Components:    c.DebianComponents,
+	}
+
+	if isArchived {
+		rc.Mirror = "http://archive.debian.org/debian"
+		rc.SecurityMirror = "http://archive.debian.org/debian-security"
+		// Old security path format for releases before bullseye
+		rc.SecuritySuite = releaseName + "/updates"
+		// Old releases don't have non-free-firmware
+		rc.Components = filterComponents(c.DebianComponents, "non-free-firmware")
+	} else {
+		// Current releases use the standard format
+		rc.SecurityMirror = "http://security.debian.org/debian-security"
+		rc.SecuritySuite = releaseName + "-security"
+	}
+
+	return rc
+}
+
+// GetAllReleaseConfigs returns release configs for all configured releases
+func (c *Config) GetAllReleaseConfigs() []ReleaseConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	configs := make([]ReleaseConfig, 0, len(c.DebianReleases))
+	for _, releaseName := range c.DebianReleases {
+		configs = append(configs, c.GetReleaseConfig(releaseName))
+	}
+	return configs
+}
+
+// filterComponents removes a component from the list
+func filterComponents(components []string, toRemove string) []string {
+	result := make([]string, 0, len(components))
+	for _, c := range components {
+		if c != toRemove {
+			result = append(result, c)
+		}
+	}
+	return result
 }
