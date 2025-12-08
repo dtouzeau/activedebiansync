@@ -37,6 +37,16 @@ type PackageManagerProvider interface {
 	AddPackage(debPath, release, component, architecture string) error
 }
 
+// CVEScannerProvider interface for CVE scanning
+type CVEScannerProvider interface {
+	GetStatus() map[string]interface{}
+	UpdateCVEData() error
+	Scan(release, component, architecture string, includePackages bool) (interface{}, error)
+	GetPackageCVEs(packageName, release string) (interface{}, error)
+	SearchCVE(cveID string) (map[string]interface{}, error)
+	IsEnabled() bool
+}
+
 // WebConsole manages the web console server
 type WebConsole struct {
 	config        *config.Config
@@ -48,6 +58,7 @@ type WebConsole struct {
 	httpServer    interface{}
 	syncer        interface{}
 	pkgManager    interface{}
+	cveScanner    CVEScannerProvider
 	templates     *template.Template
 	sessionSecret string
 	mu            sync.RWMutex
@@ -104,6 +115,11 @@ func (wc *WebConsole) SetProviders(httpServer, syncer, pkgManager interface{}) {
 	wc.pkgManager = pkgManager
 }
 
+// SetCVEScanner sets the CVE scanner provider
+func (wc *WebConsole) SetCVEScanner(scanner CVEScannerProvider) {
+	wc.cveScanner = scanner
+}
+
 // Start starts the web console server
 func (wc *WebConsole) Start(ctx context.Context) error {
 	cfg := wc.config.Get()
@@ -157,6 +173,8 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/search", wc.requireAuth(wc.handleSearch))
 	mux.HandleFunc("/logs", wc.requireAuth(wc.handleLogs))
 	mux.HandleFunc("/users", wc.requireAuth(wc.requireAdmin(wc.handleUsers)))
+	mux.HandleFunc("/cve", wc.requireAuth(wc.handleCVE))
+	mux.HandleFunc("/cve/find", wc.requireAuth(wc.handleCVEFind))
 	mux.HandleFunc("/sync/trigger", wc.requireAuth(wc.handleSyncTrigger))
 
 	// API routes for web console
@@ -174,6 +192,14 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/search/file", wc.requireAuth(wc.handleAPISearchFile))
 	mux.HandleFunc("/api/search/package-files", wc.requireAuth(wc.handleAPIPackageFiles))
 	mux.HandleFunc("/api/logs", wc.requireAuth(wc.handleAPILogs))
+
+	// CVE API routes
+	mux.HandleFunc("/api/console/cve/status", wc.requireAuth(wc.handleAPICVEStatus))
+	mux.HandleFunc("/api/console/cve/update", wc.requireAuth(wc.handleAPICVEUpdate))
+	mux.HandleFunc("/api/console/cve/scan", wc.requireAuth(wc.handleAPICVEScan))
+	mux.HandleFunc("/api/console/cve/vulnerable", wc.requireAuth(wc.handleAPICVEVulnerable))
+	mux.HandleFunc("/api/console/cve/package", wc.requireAuth(wc.handleAPICVEPackage))
+	mux.HandleFunc("/api/console/cve/search", wc.requireAuth(wc.handleAPICVESearch))
 
 	addr := fmt.Sprintf("%s:%d", cfg.WebConsoleListenAddr, cfg.WebConsolePort)
 	wc.server = &http.Server{
@@ -502,6 +528,18 @@ func (wc *WebConsole) handleLogs(w http.ResponseWriter, r *http.Request) {
 func (wc *WebConsole) handleUsers(w http.ResponseWriter, r *http.Request) {
 	session := wc.getSession(r)
 	wc.renderUsers(w, r, session)
+}
+
+// handleCVE handles the CVE dashboard page
+func (wc *WebConsole) handleCVE(w http.ResponseWriter, r *http.Request) {
+	session := wc.getSession(r)
+	wc.renderCVEDashboard(w, r, session)
+}
+
+// handleCVEFind handles the CVE find/search page
+func (wc *WebConsole) handleCVEFind(w http.ResponseWriter, r *http.Request) {
+	session := wc.getSession(r)
+	wc.renderCVEFind(w, r, session)
 }
 
 // handleSyncTrigger triggers a sync
@@ -1293,4 +1331,187 @@ func splitLines(s string) []string {
 		lines = append(lines, current)
 	}
 	return lines
+}
+
+// CVE API handlers
+
+// handleAPICVEStatus returns CVE scanner status
+func (wc *WebConsole) handleAPICVEStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.cveScanner == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled":     false,
+			"initialized": false,
+			"error":       "CVE scanner not available",
+		})
+		return
+	}
+
+	status := wc.cveScanner.GetStatus()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+// handleAPICVEUpdate triggers CVE database update
+func (wc *WebConsole) handleAPICVEUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.cveScanner == nil {
+		http.Error(w, "CVE scanner not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	session := wc.getSession(r)
+	wc.logger.LogInfo("User %s triggered CVE database update", session.Username)
+
+	if err := wc.cveScanner.UpdateCVEData(); err != nil {
+		wc.logger.LogError("CVE database update failed: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"message": "CVE database updated successfully",
+	})
+}
+
+// handleAPICVEScan triggers a CVE scan
+func (wc *WebConsole) handleAPICVEScan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.cveScanner == nil {
+		http.Error(w, "CVE scanner not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	session := wc.getSession(r)
+	wc.logger.LogInfo("User %s triggered CVE scan", session.Username)
+
+	release := r.URL.Query().Get("release")
+	component := r.URL.Query().Get("component")
+	arch := r.URL.Query().Get("architecture")
+
+	result, err := wc.cveScanner.Scan(release, component, arch, false)
+	if err != nil {
+		wc.logger.LogError("CVE scan failed: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+		"result": result,
+	})
+}
+
+// handleAPICVEVulnerable returns list of vulnerable packages
+func (wc *WebConsole) handleAPICVEVulnerable(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.cveScanner == nil {
+		http.Error(w, "CVE scanner not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	release := r.URL.Query().Get("release")
+	component := r.URL.Query().Get("component")
+	arch := r.URL.Query().Get("architecture")
+
+	result, err := wc.cveScanner.Scan(release, component, arch, true)
+	if err != nil {
+		http.Error(w, "CVE scan failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// handleAPICVEPackage returns CVE info for a specific package
+func (wc *WebConsole) handleAPICVEPackage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.cveScanner == nil {
+		http.Error(w, "CVE scanner not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	packageName := r.URL.Query().Get("name")
+	if packageName == "" {
+		packageName = r.URL.Query().Get("package")
+	}
+	if packageName == "" {
+		http.Error(w, "Missing required parameter: name or package", http.StatusBadRequest)
+		return
+	}
+
+	release := r.URL.Query().Get("release")
+
+	result, err := wc.cveScanner.GetPackageCVEs(packageName, release)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// handleAPICVESearch searches for a specific CVE
+func (wc *WebConsole) handleAPICVESearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.cveScanner == nil {
+		http.Error(w, "CVE scanner not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	cveID := r.URL.Query().Get("cve")
+	if cveID == "" {
+		cveID = r.URL.Query().Get("id")
+	}
+	if cveID == "" {
+		http.Error(w, "Missing required parameter: cve or id", http.StatusBadRequest)
+		return
+	}
+
+	result, err := wc.cveScanner.SearchCVE(cveID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
 }

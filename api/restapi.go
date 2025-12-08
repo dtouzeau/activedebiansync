@@ -54,19 +54,20 @@ type RestAPI struct {
 	prometheusMetrics *metrics.PrometheusMetrics
 	apiServer         *http.Server
 	searchDB          *database.PackageSearchDB
+	cveScanner        CVEScannerProvider
 }
 
 // StatusResponse représente la réponse de status général
 type StatusResponse struct {
-	Status            string                 `json:"status"`
-	Uptime            string                 `json:"uptime"`
-	Version           string                 `json:"version"`
-	SyncStats         *sync.SyncStats        `json:"sync_stats"`
-	ServerStats       *server.ServerStats    `json:"server_stats"`
-	DiskSpace         *utils.DiskSpaceInfo   `json:"disk_space"`
-	UpdatesAvailable  bool                   `json:"updates_available"`
-	RepositorySize    int64                  `json:"repository_size_bytes"`
-	Clients           []server.ClientInfo    `json:"clients"`
+	Status           string               `json:"status"`
+	Uptime           string               `json:"uptime"`
+	Version          string               `json:"version"`
+	SyncStats        *sync.SyncStats      `json:"sync_stats"`
+	ServerStats      *server.ServerStats  `json:"server_stats"`
+	DiskSpace        *utils.DiskSpaceInfo `json:"disk_space"`
+	UpdatesAvailable bool                 `json:"updates_available"`
+	RepositorySize   int64                `json:"repository_size_bytes"`
+	Clients          []server.ClientInfo  `json:"clients"`
 }
 
 var startTime = time.Now()
@@ -116,7 +117,7 @@ func (api *RestAPI) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/packages/regenerate", api.withIPFilter(api.handlePackageRegenerate))
 
 	// Routes GPG
-	mux.HandleFunc("/api/gpg-key", api.handleGPGKey)              // Sans restriction pour permettre aux clients de télécharger
+	mux.HandleFunc("/api/gpg-key", api.handleGPGKey) // Sans restriction pour permettre aux clients de télécharger
 	mux.HandleFunc("/api/gpg/info", api.withIPFilter(api.handleGPGInfo))
 	mux.HandleFunc("/api/gpg/generate", api.withIPFilter(api.handleGPGGenerate))
 	mux.HandleFunc("/api/gpg/sign", api.withIPFilter(api.handleGPGSign))
@@ -154,6 +155,15 @@ func (api *RestAPI) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/search/package-files", api.withIPFilter(api.handlePackageFilesSearch))
 	mux.HandleFunc("/api/search/package-info", api.withIPFilter(api.handlePackageInfoSearch))
 	mux.HandleFunc("/api/search/status", api.withIPFilter(api.handleSearchStatus))
+
+	// Routes pour le scanner CVE
+	mux.HandleFunc("/api/cve/status", api.withIPFilter(api.handleCVEStatus))
+	mux.HandleFunc("/api/cve/update", api.withIPFilter(api.handleCVEUpdate))
+	mux.HandleFunc("/api/cve/scan", api.withIPFilter(api.handleCVEScan))
+	mux.HandleFunc("/api/cve/summary", api.withIPFilter(api.handleCVESummary))
+	mux.HandleFunc("/api/cve/package", api.withIPFilter(api.handleCVEPackage))
+	mux.HandleFunc("/api/cve/search", api.withIPFilter(api.handleCVESearch))
+	mux.HandleFunc("/api/cve/vulnerable", api.withIPFilter(api.handleCVEVulnerable))
 
 	// Route Prometheus metrics (sans restriction pour permettre scraping)
 	mux.Handle("/metrics", promhttp.Handler())
@@ -358,8 +368,8 @@ func (api *RestAPI) handleDiskSpace(w http.ResponseWriter, r *http.Request) {
 	repoSize := api.getRepositorySize(cfg.RepositoryPath)
 
 	response := map[string]interface{}{
-		"disk_space":      diskSpace,
-		"repository_size": repoSize,
+		"disk_space":                diskSpace,
+		"repository_size":           repoSize,
 		"repository_size_formatted": utils.FormatBytes(uint64(repoSize)),
 	}
 

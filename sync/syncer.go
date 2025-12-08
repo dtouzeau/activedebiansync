@@ -37,12 +37,19 @@ type PackageIndexer interface {
 	RegenerateIndexes(release, component, architecture string) error
 }
 
+// CVEScannerInterface defines the interface for CVE scanning
+type CVEScannerInterface interface {
+	ShouldScanAfterSync() bool
+	Scan(release, component, architecture string, includePackages bool) (interface{}, error)
+}
+
 // Syncer gère la synchronisation des dépôts Debian
 type Syncer struct {
 	config         *config.Config
 	logger         *utils.Logger
 	gpgManager     GPGSigner
 	packageIndexer PackageIndexer
+	cveScanner     CVEScannerInterface
 	mirrorManager  *mirrors.MirrorManager
 	httpClient     *http.Client
 	validator      *integrity.Validator
@@ -172,7 +179,7 @@ func (s *Syncer) Start(ctx context.Context) {
 	// Première synchronisation au démarrage (après 30 secondes)
 	go func() {
 		time.Sleep(30 * time.Second)
-		s.Sync()
+		_ = s.Sync()
 	}()
 
 	for {
@@ -186,7 +193,7 @@ func (s *Syncer) Start(ctx context.Context) {
 			close(s.stoppedChan)
 			return
 		case <-ticker.C:
-			s.Sync()
+			_ = s.Sync()
 		}
 	}
 }
@@ -338,6 +345,18 @@ func (s *Syncer) Sync() error {
 	if s.updatesDB != nil && s.updatesDB.IsFirstSync() {
 		s.updatesDB.MarkFirstSyncComplete()
 		s.logger.LogInfo("First sync completed - future package updates will be recorded to database")
+	}
+
+	// Run CVE scan after sync if enabled
+	if s.cveScanner != nil && s.cveScanner.ShouldScanAfterSync() {
+		s.logger.LogInfo("Running CVE scan after sync...")
+		go func() {
+			if _, err := s.cveScanner.Scan("", "", "", false); err != nil {
+				s.logger.LogError("CVE scan after sync failed: %v", err)
+			} else {
+				s.logger.LogInfo("CVE scan after sync completed")
+			}
+		}()
 	}
 
 	s.logger.LogInfo("Sync completed in %s", duration)
@@ -532,14 +551,17 @@ func (s *Syncer) downloadFileResumeWithValidation(url, destPath, releaseName, re
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
-	defer out.Close()
+	defer func(out *os.File) {
+		_ = out.Close()
+	}(out)
 
-	// Effectuer la requête
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to download file: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		_ = Body.Close()
+	}(resp.Body)
 
 	// Vérifier le code de statut
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
@@ -666,6 +688,11 @@ func (s *Syncer) GetSearchDB() *database.PackageSearchDB {
 // SetPackageIndexer définit le gestionnaire d'index de packages
 func (s *Syncer) SetPackageIndexer(indexer PackageIndexer) {
 	s.packageIndexer = indexer
+}
+
+// SetCVEScanner sets the CVE scanner for the syncer
+func (s *Syncer) SetCVEScanner(scanner CVEScannerInterface) {
+	s.cveScanner = scanner
 }
 
 // CheckForUpdates vérifie si de nouvelles mises à jour sont disponibles

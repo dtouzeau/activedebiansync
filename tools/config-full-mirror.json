@@ -6,6 +6,12 @@
   "sync_debian_installer": false,
   "sync_installer_udebs": false,
   "sync_installer_images": false,
+  "cve_scanner_enabled": false,
+  "cve_scan_after_sync": true,
+  "cve_cache_expiry_hours": 6,
+  "cve_nvd_enabled": false,
+  "cve_nvd_api_key": "",
+  "cve_osv_enabled": true,
   "installer_image_types": ["netboot", "hd-media", "cdrom"],
   "debian_releases": [
     "bookworm",

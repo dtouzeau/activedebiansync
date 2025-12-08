@@ -105,6 +105,14 @@ type Config struct {
 	StorageHDDPath              string `json:"storage_hdd_path"`              // Chemin vers le stockage HDD (pour fichiers anciens)
 	StorageTieringAgeDays       int    `json:"storage_tiering_age_days"`      // Age en jours avant migration vers HDD
 
+	// Paramètres du scanner CVE
+	CVEScannerEnabled   bool   `json:"cve_scanner_enabled"`    // Activer le scanner CVE
+	CVEScanAfterSync    bool   `json:"cve_scan_after_sync"`    // Scanner automatiquement après la synchronisation
+	CVECacheExpiryHours int    `json:"cve_cache_expiry_hours"` // Durée de validité du cache CVE en heures
+	CVENVDEnabled       bool   `json:"cve_nvd_enabled"`        // Activer l'intégration NVD pour les scores CVSS
+	CVENVDAPIKey        string `json:"cve_nvd_api_key"`        // Clé API NVD (optionnel, améliore le rate limit)
+	CVEOSVEnabled       bool   `json:"cve_osv_enabled"`        // Activer l'intégration OSV.dev
+
 	// Paramètres de la console web
 	WebConsoleEnabled          bool   `json:"web_console_enabled"`             // Activer la console web
 	WebConsolePort             int    `json:"web_console_port"`                // Port de la console web
@@ -190,6 +198,14 @@ func DefaultConfig() *Config {
 		StorageSSDPath:              "",
 		StorageHDDPath:              "",
 		StorageTieringAgeDays:       30, // 30 jours
+		// Scanner CVE
+		CVEScannerEnabled:   true, // Activé par défaut
+		CVEScanAfterSync:    true, // Scanner après sync par défaut
+		CVECacheExpiryHours: 6,    // 6 heures de cache
+		CVENVDEnabled:       true, // NVD activé par défaut pour les scores CVSS
+		CVENVDAPIKey:        "",   // Clé API NVD optionnelle
+		CVEOSVEnabled:       true, // OSV.dev activé par défaut
+
 		// Console web
 		WebConsoleEnabled:          false, // Désactivé par défaut
 		WebConsolePort:             8090,

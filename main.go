@@ -3,6 +3,7 @@ package main
 import (
 	"activedebiansync/api"
 	"activedebiansync/config"
+	"activedebiansync/cvescanner"
 	"activedebiansync/database"
 	"activedebiansync/gpg"
 	"activedebiansync/metrics"
@@ -37,6 +38,9 @@ func main() {
 			return
 		case "artica":
 			handleArticaCommand()
+			return
+		case "cve":
+			handleCVECommand()
 			return
 		case "version", "-version", "--version":
 			fmt.Printf("%s v%s\n", AppName, version)
@@ -169,6 +173,13 @@ func startDaemon() {
 		}
 	}
 
+	// Initialiser le scanner CVE
+	cveScanner := cvescanner.NewCVEScanner(cfg, logger)
+	cveAdapter := cvescanner.NewCVEScannerAdapter(cveScanner)
+	restAPI.SetCVEScanner(cveScanner)
+	syncer.SetCVEScanner(cveAdapter)
+	logger.LogInfo("CVE scanner initialized")
+
 	// Initialiser la persistence des métriques
 	metricsPersistence := metrics.NewMetricsPersistence(*configPath)
 
@@ -291,6 +302,7 @@ func startDaemon() {
 		} else {
 			// Set providers for the web console
 			webConsole.SetProviders(httpServer, syncer, pkgManager)
+			webConsole.SetCVEScanner(cveAdapter)
 
 			go func() {
 				if err := webConsole.Start(ctx); err != nil {
@@ -404,6 +416,7 @@ func printHelp() {
 	fmt.Println("  package        Manage custom packages (see 'package help')")
 	fmt.Println("  artica         Manage Artica packages (see 'artica help')")
 	fmt.Println("  gpg            Manage GPG keys (see 'gpg help')")
+	fmt.Println("  cve            CVE vulnerability scanner (see 'cve help')")
 	fmt.Println("  version        Show version")
 	fmt.Println("  help           Show this help")
 	fmt.Println("\nDaemon Options:")
@@ -453,6 +466,14 @@ func printHelp() {
 	fmt.Println("  GET  /api/gpg/export?format=json         - Export public key (JSON)")
 	fmt.Println("  GET  /api/gpg/instructions               - Get client setup instructions")
 	fmt.Println("  GET  /api/gpg-key                        - Download public key (no auth)")
+	fmt.Println("\nCVE Scanner API:")
+	fmt.Println("  GET  /api/cve/status                     - Get CVE scanner status")
+	fmt.Println("  POST /api/cve/update                     - Update CVE database")
+	fmt.Println("  GET  /api/cve/scan                       - Scan repository for CVEs")
+	fmt.Println("  GET  /api/cve/summary                    - Get CVE summary across releases")
+	fmt.Println("  GET  /api/cve/package?name=<pkg>         - Get CVEs for a package")
+	fmt.Println("  GET  /api/cve/search?cve=<CVE-ID>        - Search for specific CVE")
+	fmt.Println("  GET  /api/cve/vulnerable                 - List vulnerable packages")
 	fmt.Println("\nExamples:")
 	fmt.Println("  # Start with default config")
 	fmt.Printf("  %s\n\n", os.Args[0])

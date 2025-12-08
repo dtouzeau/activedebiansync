@@ -142,6 +142,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
 				<li class="%s"><a href="/logs"><i class="material-icons">article</i> Logs</a></li>
 				<li class="%s"><a href="/settings"><i class="material-icons">settings</i> Settings</a></li>
 				%s
+				%s
 			</ul>
 		</aside>
 		<div class="main-content">
@@ -203,6 +204,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
 		activeClass(page, "events"),
 		activeClass(page, "logs"),
 		activeClass(page, "settings"),
+		cveMenu(page),
 		adminMenu(isAdmin, page),
 		content,
 		time.Now().Year(),
@@ -214,6 +216,14 @@ func activeClass(currentPage, menuPage string) string {
 		return "active"
 	}
 	return ""
+}
+
+func cveMenu(page string) string {
+	return fmt.Sprintf(`
+				<li class="nav-heading">Security</li>
+				<li class="%s"><a href="/cve"><i class="material-icons">security</i> CVE</a></li>
+				<li class="%s"><a href="/cve/find"><i class="material-icons">find_in_page</i> Find</a></li>
+	`, activeClass(page, "cve"), activeClass(page, "cve-find"))
 }
 
 func adminMenu(isAdmin bool, page string) string {
