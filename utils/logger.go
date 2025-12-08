@@ -5,17 +5,19 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
 
 // Logger gère les logs de l'application
 type Logger struct {
-	syncLog   *log.Logger
-	accessLog *log.Logger
-	syncFile  *os.File
+	syncLog    *log.Logger
+	accessLog  *log.Logger
+	syncFile   *os.File
 	accessFile *os.File
-	mu        sync.Mutex
+	mu         sync.Mutex
 }
 
 var (
@@ -133,4 +135,15 @@ func (l *Logger) Close() error {
 		}
 	}
 	return err
+}
+func GetCalleRuntime() string {
+	if pc, file, line, ok := runtime.Caller(1); ok {
+		file = file[strings.LastIndex(file, "/")+1:]
+		funcName := runtime.FuncForPC(pc).Name()
+		funcName = strings.ReplaceAll(funcName, "github.com/dtouzeau/articarest/", "")
+		funcName = strings.ReplaceAll(funcName, "github.com/dtouzeau/activeupdate/", "")
+		funcName = strings.ReplaceAll(funcName, "articarest/dnsdist/", "")
+		return fmt.Sprintf("%s[%s:%d]", file, funcName, line)
+	}
+	return ""
 }

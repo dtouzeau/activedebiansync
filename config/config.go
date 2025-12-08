@@ -24,6 +24,7 @@ type Config struct {
 	SyncPackages         bool     `json:"sync_packages"`          // Télécharger les packages .deb (pas seulement les métadonnées)
 	SyncContents         bool     `json:"sync_contents"`          // Télécharger les fichiers Contents pour la recherche (comme apt-file)
 	PackageSearchEnabled bool     `json:"package_search_enabled"` // Activer la recherche de packages
+	ConfigPath           string   `json:"config_path"`
 
 	// Paramètres debian-installer (pour build-simple-cdd, netboot, etc.)
 	SyncDebianInstaller bool     `json:"sync_debian_installer"` // Activer la synchronisation debian-installer
@@ -60,6 +61,7 @@ type Config struct {
 	LogPath       string `json:"log_path"`
 	AccessLogPath string `json:"access_log_path"`
 	PIDFile       string `json:"pid_file"`
+	SystemID      string `json:"system_id"` //Unique identifier
 
 	// Paramètres d'exécution
 	RunAsUser  string `json:"run_as_user"`  // Utilisateur Unix (optionnel)
@@ -84,6 +86,10 @@ type Config struct {
 	ProxyURL         string `json:"proxy_url"`         // URL du proxy (ex: "http://proxy.example.com:8080")
 	ProxyUsername    string `json:"proxy_username"`    // Nom d'utilisateur pour le proxy (optionnel)
 	ProxyPassword    string `json:"proxy_password"`    // Mot de passe pour le proxy (optionnel)
+
+	// Paramètres Artica Repository
+	SyncArticaRepository bool `json:"sync_artica_repository"` // Activer la synchronisation des dépôts Artica
+	ArticaRepositorySSL  bool `json:"artica_repository_ssl"`  // Utiliser HTTPS pour les dépôts Artica
 
 	// Paramètres de validation d'intégrité
 	IntegrityCheckEnabled bool `json:"integrity_check_enabled"` // Activer la validation des checksums
@@ -172,7 +178,9 @@ func DefaultConfig() *Config {
 		ProxyURL:                    "",
 		ProxyUsername:               "",
 		ProxyPassword:               "",
-		IntegrityCheckEnabled:       true, // Activé par défaut pour la sécurité
+		SyncArticaRepository:        false, // Désactivé par défaut
+		ArticaRepositorySSL:         false, // HTTP par défaut
+		IntegrityCheckEnabled:       true,  // Activé par défaut pour la sécurité
 		IntegrityAutoRetry:          true,
 		IntegrityMaxRetries:         3,
 		StorageDeduplicationEnabled: true,  // Activé par défaut pour économiser l'espace
@@ -222,7 +230,7 @@ func LoadConfig(path string) (*Config, error) {
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
-
+	cfg.ConfigPath = path
 	return cfg, nil
 }
 
@@ -231,7 +239,7 @@ func (c *Config) Save(path string) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	data, err := json.MarshalIndent(c, "", "  ")
+	data, err := json.MarshalIndent(c, "", "\t")
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}

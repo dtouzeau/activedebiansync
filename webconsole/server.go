@@ -912,6 +912,8 @@ func (wc *WebConsole) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 		"web_console_tls_use_server_cert": cfg.WebConsoleTLSUseServerCert,
 		"web_console_tls_cert_file":       cfg.WebConsoleTLSCertFile,
 		"web_console_tls_key_file":        cfg.WebConsoleTLSKeyFile,
+		"sync_artica_repository":          cfg.SyncArticaRepository,
+		"artica_repository_ssl":           cfg.ArticaRepositorySSL,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -953,6 +955,13 @@ func (wc *WebConsole) handleAPIConfigUpdate(w http.ResponseWriter, r *http.Reque
 		}
 		if v, ok := params["web_console_tls_key_file"].(string); ok && v != "" {
 			cfg.WebConsoleTLSKeyFile = v
+		}
+		// Artica repository settings
+		if v, ok := params["sync_artica_repository"].(bool); ok {
+			cfg.SyncArticaRepository = v
+		}
+		if v, ok := params["artica_repository_ssl"].(bool); ok {
+			cfg.ArticaRepositorySSL = v
 		}
 	})
 

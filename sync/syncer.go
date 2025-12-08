@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"activedebiansync/articarepos"
 	"activedebiansync/config"
 	"activedebiansync/database"
 	"activedebiansync/integrity"
@@ -11,11 +12,15 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,32 +29,35 @@ import (
 	"github.com/ulikunitz/xz"
 )
 
-// GPGSigner interface pour la signature GPG
 type GPGSigner interface {
 	SignAllReleaseFiles() error
 	IsEnabled() bool
 }
+type PackageIndexer interface {
+	RegenerateIndexes(release, component, architecture string) error
+}
 
 // Syncer gère la synchronisation des dépôts Debian
 type Syncer struct {
-	config        *config.Config
-	logger        *utils.Logger
-	gpgManager    GPGSigner
-	mirrorManager *mirrors.MirrorManager
-	httpClient    *http.Client
-	validator     *integrity.Validator
-	analytics     *stats.Analytics
-	optimizer     *storage.Optimizer
-	updatesDB     *database.UpdatesDB
-	searchDB      *database.PackageSearchDB
-	isRunning     atomic.Bool
-	lastSync      time.Time
-	lastError     error
-	stats         *SyncStats
-	rateLimiter   *utils.RateLimiter
-	mu            sync.RWMutex
-	stopChan      chan struct{}
-	stoppedChan   chan struct{}
+	config         *config.Config
+	logger         *utils.Logger
+	gpgManager     GPGSigner
+	packageIndexer PackageIndexer
+	mirrorManager  *mirrors.MirrorManager
+	httpClient     *http.Client
+	validator      *integrity.Validator
+	analytics      *stats.Analytics
+	optimizer      *storage.Optimizer
+	updatesDB      *database.UpdatesDB
+	searchDB       *database.PackageSearchDB
+	isRunning      atomic.Bool
+	lastSync       time.Time
+	lastError      error
+	stats          *SyncStats
+	rateLimiter    *utils.RateLimiter
+	mu             sync.RWMutex
+	stopChan       chan struct{}
+	stoppedChan    chan struct{}
 }
 
 // DownloadJob représente un job de téléchargement
@@ -294,6 +302,12 @@ func (s *Syncer) Sync() error {
 	// Synchroniser les composants debian-installer si activé (pour build-simple-cdd, netboot, etc.)
 	if cfg.SyncDebianInstaller {
 		s.syncDebianInstaller()
+	}
+
+	// Synchroniser les dépôts Artica si activé
+	if cfg.SyncArticaRepository {
+		s.syncArticaRepository()
+		s.SyncArticaCores()
 	}
 
 	// Signer tous les fichiers Release avec GPG si activé
@@ -647,6 +661,11 @@ func (s *Syncer) SetSearchDB(db *database.PackageSearchDB) {
 // GetSearchDB retourne la base de données de recherche de packages
 func (s *Syncer) GetSearchDB() *database.PackageSearchDB {
 	return s.searchDB
+}
+
+// SetPackageIndexer définit le gestionnaire d'index de packages
+func (s *Syncer) SetPackageIndexer(indexer PackageIndexer) {
+	s.packageIndexer = indexer
 }
 
 // CheckForUpdates vérifie si de nouvelles mises à jour sont disponibles
@@ -1611,4 +1630,457 @@ func (s *Syncer) CheckAndEnsureDebianInstaller() {
 	} else {
 		s.logger.LogInfo("All debian-installer files are present")
 	}
+}
+
+func (s *Syncer) SyncArticaMain() (error, articarepos.Repos) {
+	s.logger.LogInfo("Syncing Artica main versions...")
+	var HttpContent1 = regexp.MustCompile(`<CONTENT>(.+?)</CONTENT>`)
+	zUrl := articarepos.ArticaCoreMainVer(s.config)
+	s.logger.LogInfo("Downloading %v", zUrl)
+	indexContent, err := s.downloadArticaIndex(zUrl)
+	if err != nil {
+		return fmt.Errorf("%v Failed to download Artica Core index : %v", utils.GetCalleRuntime(), err), articarepos.Repos{}
+	}
+	if len(indexContent) == 0 {
+		return fmt.Errorf("%v Empty Artica Core index received", utils.GetCalleRuntime()), articarepos.Repos{}
+	}
+	Text := utils.RegexGroup1(HttpContent1, indexContent)
+	if len(Text) < 10 {
+		return fmt.Errorf("%v Error Corrupted %v", utils.GetCalleRuntime(), Text), articarepos.Repos{}
+	}
+	err, rep := articarepos.ParseArticaMainVers(Text)
+	if err != nil {
+		return err, articarepos.Repos{}
+	}
+	return nil, rep
+}
+func (s *Syncer) SyncArticaCores() {
+	err, Rep := s.SyncArticaMain()
+	s.logger.LogInfo("Syncing Artica Cores version...")
+	zUrl := articarepos.ArticaCoreUrlIndex(s.config)
+	s.logger.LogInfo("Downloading %v", zUrl)
+	indexContent, err := s.downloadArticaIndex(zUrl)
+	if err != nil {
+		s.logger.LogError("%v Failed to download Artica Core index : %v", utils.GetCalleRuntime(), err)
+		return
+	}
+
+	if len(indexContent) == 0 {
+		s.logger.LogError("Empty Artica Core index received")
+		return
+	}
+	Decoded := articarepos.Base64Decode(indexContent)
+
+	if len(Decoded) < 10 {
+		s.logger.LogError("%v Error Corrupted %v len<10", utils.GetCalleRuntime(), indexContent)
+		return
+	}
+	IndexDir := s.config.RepositoryPath + "/artica/indexes"
+	err = utils.CreateDir(IndexDir)
+	if err != nil {
+		s.logger.LogError("%v Failed to create indexes directory %s : %v", utils.GetCalleRuntime(), IndexDir, err)
+		return
+	}
+	IndexPath := IndexDir + "/core.json"
+	err, Rep = articarepos.ParseArticaCoreServicePacks(Rep, indexContent)
+	if err != nil {
+		s.logger.LogError("%v Failed to parse Artica Core index : %v", utils.GetCalleRuntime(), err)
+		return
+	}
+	Rep = articarepos.ArticaUrlHotfixes(s.config, Rep)
+	for _, THots := range Rep.HotfixesUrls {
+		indexContent, err := s.downloadArticaIndex(THots.URL)
+		if err != nil {
+			s.logger.LogError("%v Failed to download Artica Hotfix index : %v", utils.GetCalleRuntime(), err)
+			return
+		}
+
+		err, Records := articarepos.ArticaHotfixes(s.config, THots, indexContent)
+		if err != nil {
+			s.logger.LogError("%v Failed to parse Artica Hotfix dev index : %v", utils.GetCalleRuntime(), err)
+			return
+		}
+		for _, rec := range Records {
+			Rep.HotfixesDev = append(Rep.HotfixesDev, rec)
+		}
+	}
+
+	NewJsonBytes, err := json.MarshalIndent(Rep, "", "\t")
+	if err != nil {
+		s.logger.LogError("%v Failed to encode to json Artica Core index : %v", utils.GetCalleRuntime(), err)
+		return
+	}
+	err = utils.FilePutContentsBytes(IndexPath, NewJsonBytes)
+	if err != nil {
+		s.logger.LogError("%v Failed to save Artica Core index %v : %v", utils.GetCalleRuntime(), IndexPath, err)
+		return
+	}
+	for _, Conf := range Rep.OFF {
+		var DonwloadConf articarepos.ArticaDownloader
+		DonwloadConf.DestinationFile = fmt.Sprintf("%s/artica/%v/%v", s.config.RepositoryPath, Conf.VERSION, Conf.FILENAME)
+		DonwloadConf.Size = Conf.FILESIZE
+		DonwloadConf.Url = Conf.URL
+		DonwloadConf.Md5 = Conf.MD5
+		DonwloadConf.TempDir = fmt.Sprintf("%s/artica/tmp", s.config.RepositoryPath)
+		err := s.DownloadPackage(DonwloadConf)
+		if err != nil {
+			s.logger.LogError("%v Failed download Artica Core : %v", utils.GetCalleRuntime(), err)
+			return
+		}
+	}
+	for MainVersion, Array1 := range Rep.ServicePacks {
+		for _, Conf := range Array1 {
+			var DonwloadConf articarepos.ArticaDownloader
+			DonwloadConf.DestinationFile = fmt.Sprintf("%s/artica/%v/SP/%v", s.config.RepositoryPath, MainVersion, filepath.Base(Conf.URL))
+			DonwloadConf.Size = Conf.FILESIZE
+			DonwloadConf.Url = Conf.URL
+			DonwloadConf.Md5 = Conf.MD5
+			DonwloadConf.TempDir = fmt.Sprintf("%s/artica/tmp", s.config.RepositoryPath)
+			err := s.DownloadPackage(DonwloadConf)
+			if err != nil {
+				s.logger.LogError("%v Failed download Artica Service Pack : %v", utils.GetCalleRuntime(), err)
+				return
+			}
+		}
+	}
+	for _, Conf := range Rep.HotfixesOfficials {
+		var DonwloadConf articarepos.ArticaDownloader
+		DonwloadConf.DestinationFile = fmt.Sprintf("%s/artica/%v/SP/%v/hotfix/%v", s.config.RepositoryPath, Conf.ArticaVersion, Conf.ServicePack, filepath.Base(Conf.URL))
+		DonwloadConf.Size = utils.StrToInt64(Conf.Size)
+		DonwloadConf.Url = Conf.Url
+		DonwloadConf.Md5 = Conf.Md5
+		DonwloadConf.TempDir = fmt.Sprintf("%s/artica/tmp", s.config.RepositoryPath)
+		err := s.DownloadPackage(DonwloadConf)
+		if err != nil {
+			s.logger.LogError("%v Failed download Artica Official Hotfix : %v", utils.GetCalleRuntime(), err)
+			return
+		}
+	}
+	for _, Conf := range Rep.HotfixesDev {
+		var DonwloadConf articarepos.ArticaDownloader
+		DonwloadConf.DestinationFile = fmt.Sprintf("%s/artica/%v/SP/%v/hotfix-dev/%v", s.config.RepositoryPath, Conf.ArticaVersion, Conf.ServicePack, filepath.Base(Conf.URL))
+		DonwloadConf.Size = utils.StrToInt64(Conf.Size)
+		DonwloadConf.Url = Conf.Url
+		DonwloadConf.Md5 = Conf.Md5
+		DonwloadConf.TempDir = fmt.Sprintf("%s/artica/tmp", s.config.RepositoryPath)
+		err := s.DownloadPackage(DonwloadConf)
+		if err != nil {
+			s.logger.LogError("%v Failed download Artica Official Hotfix : %v", utils.GetCalleRuntime(), err)
+			return
+		}
+	}
+
+}
+func (s *Syncer) syncArticaRepository() {
+	cfg := s.config.Get()
+
+	s.logger.LogInfo("Syncing Artica repositories...")
+
+	// Obtenir les URLs des index Artica pour chaque distribution
+	articaURLs := articarepos.GetArticaRepoUrls(s.config)
+
+	// Track which releases need index regeneration
+	releasesNeedingUpdate := make(map[string]bool)
+	packagesBuilt := 0
+
+	for _, release := range cfg.DebianReleases {
+		indexURL, exists := articaURLs[release]
+		if !exists {
+			s.logger.LogInfo("No Artica repository URL for release %s, skipping", release)
+			continue
+		}
+
+		s.logger.LogInfo("Syncing Artica repository for %s from %s", release, indexURL)
+
+		// Télécharger le contenu de l'index
+		indexContent, err := s.downloadArticaIndex(indexURL)
+		if err != nil {
+			s.logger.LogError("Failed to download Artica index for %s: %v", release, err)
+			continue
+		}
+
+		if len(indexContent) == 0 {
+			s.logger.LogError("Empty Artica index received for %s", release)
+			continue
+		}
+
+		// Parser l'index et obtenir la liste des packages
+		err, articaRepo := articarepos.ListArticaReposSrc(s.config, release, indexContent)
+		if err != nil {
+			s.logger.LogError("Failed to parse Artica index for %s: %v", release, err)
+			continue
+		}
+
+		s.logger.LogInfo("Found %d Artica packages for %s", len(articaRepo.Softs), release)
+
+		// Télécharger chaque package et créer le .deb
+		for _, soft := range articaRepo.Softs {
+			if err := s.downloadArticaPackage(soft); err != nil {
+				s.logger.LogError("Failed to download Artica package %s: %v", soft.ProductCode, err)
+				atomic.AddInt64(&s.stats.FailedFiles, 1)
+				continue
+			}
+			s.logger.LogSync("Downloaded Artica package: %s v%s", soft.ProductCode, soft.Version)
+			atomic.AddInt64(&s.stats.TotalFiles, 1)
+
+			// Créer le package .deb
+			s.logger.LogInfo("Building .deb package for %s...", soft.ProductCode)
+			result, err := articarepos.BuildDebPackage(soft)
+			if err != nil {
+				s.logger.LogError("Failed to build .deb for %s: %v", soft.ProductCode, err)
+				continue
+			}
+			s.logger.LogSync("Built .deb package: %s", result.DebPath)
+			s.logger.LogInfo("Extracted content to: %s", result.ExtractPath)
+
+			// Ajouter le package au dépôt Debian mirror
+			s.logger.LogInfo("Adding %s to Debian repository...", filepath.Base(result.DebPath))
+			if err := articarepos.AddToRepository(result.DebPath, cfg.RepositoryPath, release, "artica", "all"); err != nil {
+				s.logger.LogError("Failed to add %s to repository: %v", soft.ProductCode, err)
+			} else {
+				s.logger.LogSync("Added to repository: pool/artica/a/%s", filepath.Base(result.DebPath))
+				releasesNeedingUpdate[release] = true
+				packagesBuilt++
+			}
+		}
+	}
+
+	// Régénérer les indexes pour les releases modifiées
+	if packagesBuilt > 0 && s.packageIndexer != nil {
+		s.logger.LogInfo("Regenerating repository indexes for Artica packages...")
+
+		for release := range releasesNeedingUpdate {
+			for _, arch := range cfg.DebianArchs {
+				s.logger.LogInfo("Regenerating indexes for %s/artica/%s", release, arch)
+				if err := s.packageIndexer.RegenerateIndexes(release, "artica", arch); err != nil {
+					s.logger.LogError("Failed to regenerate indexes for %s/artica/%s: %v", release, arch, err)
+				} else {
+					s.logger.LogSync("Indexes regenerated for %s/artica/%s", release, arch)
+				}
+			}
+			// Also regenerate for "all" architecture
+			s.logger.LogInfo("Regenerating indexes for %s/artica/all", release)
+			if err := s.packageIndexer.RegenerateIndexes(release, "artica", "all"); err != nil {
+				s.logger.LogError("Failed to regenerate indexes for %s/artica/all: %v", release, err)
+			}
+		}
+
+		s.logger.LogInfo("Repository indexes updated with %d Artica packages", packagesBuilt)
+	}
+
+	s.logger.LogInfo("Artica repository sync completed")
+}
+func (s *Syncer) downloadArticaIndex(indexURL string) (string, error) {
+	resp, err := s.httpClient.Get(indexURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch Artica index: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("bad status fetching Artica index: %s", resp.Status)
+	}
+
+	content, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read Artica index: %w", err)
+	}
+
+	return string(content), nil
+}
+func (s *Syncer) DownloadPackage(Params articarepos.ArticaDownloader) error {
+
+	if _, err := os.Stat(Params.DestinationFile); err == nil {
+		valid, err := s.verifyArticaFile(Params.DestinationFile, Params.Md5, Params.Size)
+		if err != nil {
+			s.logger.LogError("Error verifying existing file %s: %v, will re-download", Params.DestinationFile, err)
+		} else if valid {
+			return nil
+		} else {
+			s.logger.LogInfo("Package %s exists but MD5 (%s)/size (%d bytes) mismatch, re-downloading", filepath.Base(Params.Url), Params.Md5, Params.Size)
+		}
+	}
+
+	if err := os.MkdirAll(Params.TempDir, 0755); err != nil {
+		return fmt.Errorf("failed to create temp directory %s: %w", Params.TempDir, err)
+	}
+	TargetDir := filepath.Dir(Params.DestinationFile)
+	err := utils.CreateDir(TargetDir)
+	if err != nil {
+		return fmt.Errorf("failed to create target directory %s: %w", TargetDir, err)
+	}
+	Tempfile := Params.TempDir + "/" + filepath.Base(Params.Url)
+
+	if _, err := os.Stat(Tempfile); err == nil {
+		valid, err := s.verifyArticaFile(Tempfile, Params.Md5, Params.Size)
+		if err != nil {
+			s.logger.LogError("Error verifying existing file %s: %v, will re-download", Tempfile, err)
+		} else if valid {
+			s.logger.LogSync("Package %s already up to date (MD5 and size match)", filepath.Base(Params.Url))
+			return nil
+		} else {
+			s.logger.LogInfo("%v Package %s exists but MD5 (%s) /size mismatch, re-downloading", utils.GetCalleRuntime(), filepath.Base(Params.Url), Params.Md5)
+		}
+	}
+	textSize := ""
+	if Params.Size > 0 {
+		textSize = fmt.Sprintf("(%d bytes)", Params.Size)
+	}
+	if len(Params.Md5) > 0 {
+		textSize = textSize + fmt.Sprintf("MD5: %s", Params.Md5)
+	}
+	s.logger.LogInfo("%v Downloading package %s %s from %s", utils.GetCalleRuntime(), filepath.Base(Params.Url), textSize, Params.Url)
+
+	resp, err := s.httpClient.Get(Params.Url)
+	if err != nil {
+		return fmt.Errorf("failed to download package: %w", err)
+	}
+	defer func(Body io.ReadCloser) {
+		_ = Body.Close()
+	}(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bad status downloading package: %s", resp.Status)
+	}
+	tmpFile := Tempfile + ".tmp"
+	out, err := os.Create(tmpFile)
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+
+	hash := md5.New()
+	writer := io.MultiWriter(out, hash)
+
+	cfg := s.config.Get()
+	var reader io.Reader = resp.Body
+	if cfg.DownloadBandwidthLimit > 0 {
+		bandwidthBytes := int64(cfg.DownloadBandwidthLimit) * 1024
+		reader = utils.NewRateLimitedReader(resp.Body, bandwidthBytes)
+	}
+
+	written, err := io.Copy(writer, reader)
+	_ = out.Close()
+
+	if err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to write package file: %w", err)
+	}
+	if Params.Size > 10 {
+		if written != Params.Size {
+			_ = os.Remove(tmpFile)
+			return fmt.Errorf("size mismatch: expected %d, got %d", Params.Size, written)
+		}
+	}
+	if len(Params.Md5) > 5 {
+		downloadedMD5 := hex.EncodeToString(hash.Sum(nil))
+		if !strings.EqualFold(downloadedMD5, Params.Md5) {
+			_ = os.Remove(tmpFile)
+			return fmt.Errorf("MD5 mismatch: expected %s, got %s", Params.Md5, downloadedMD5)
+		}
+	}
+
+	if err := os.Rename(tmpFile, Params.DestinationFile); err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to rename temp file: %w", err)
+	}
+	atomic.AddInt64(&s.stats.TotalBytes, written)
+	return nil
+}
+func (s *Syncer) downloadArticaPackage(soft articarepos.ArticaSoft) error {
+	if err := os.MkdirAll(soft.TempDir, 0755); err != nil {
+		return fmt.Errorf("failed to create temp directory %s: %w", soft.TempDir, err)
+	}
+
+	if _, err := os.Stat(soft.Tempfile); err == nil {
+		valid, err := s.verifyArticaFile(soft.Tempfile, soft.Md5, soft.Size)
+		if err != nil {
+			s.logger.LogError("Error verifying existing file %s: %v, will re-download", soft.Tempfile, err)
+		} else if valid {
+			s.logger.LogSync("Package %s already up to date (MD5 and size match)", soft.ProductCode)
+			return nil
+		} else {
+			s.logger.LogInfo("Package %s exists but MD5/size mismatch, re-downloading", soft.ProductCode)
+		}
+	}
+	s.logger.LogInfo("Downloading Artica package %s v%s (%d bytes) from %s", soft.ProductCode, soft.Version, soft.Size, soft.Url)
+
+	resp, err := s.httpClient.Get(soft.Url)
+	if err != nil {
+		return fmt.Errorf("failed to download package: %w", err)
+	}
+	defer func(Body io.ReadCloser) {
+		_ = Body.Close()
+	}(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bad status downloading package: %s", resp.Status)
+	}
+	tmpFile := soft.Tempfile + ".tmp"
+	out, err := os.Create(tmpFile)
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+
+	hash := md5.New()
+	writer := io.MultiWriter(out, hash)
+
+	cfg := s.config.Get()
+	var reader io.Reader = resp.Body
+	if cfg.DownloadBandwidthLimit > 0 {
+		bandwidthBytes := int64(cfg.DownloadBandwidthLimit) * 1024
+		reader = utils.NewRateLimitedReader(resp.Body, bandwidthBytes)
+	}
+
+	written, err := io.Copy(writer, reader)
+	_ = out.Close()
+
+	if err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to write package file: %w", err)
+	}
+	if written != soft.Size {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("size mismatch: expected %d, got %d", soft.Size, written)
+	}
+	downloadedMD5 := hex.EncodeToString(hash.Sum(nil))
+	if !strings.EqualFold(downloadedMD5, soft.Md5) {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("MD5 mismatch: expected %s, got %s", soft.Md5, downloadedMD5)
+	}
+	if err := os.Rename(tmpFile, soft.Tempfile); err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to rename temp file: %w", err)
+	}
+	atomic.AddInt64(&s.stats.TotalBytes, written)
+	return nil
+}
+func (s *Syncer) verifyArticaFile(filepath string, expectedMD5 string, expectedSize int64) (bool, error) {
+	stat, err := os.Stat(filepath)
+	if err != nil {
+		return false, fmt.Errorf("failed to stat file: %w", err)
+	}
+	if expectedSize > 0 {
+		if stat.Size() != expectedSize {
+			return false, nil
+		}
+	}
+
+	if len(expectedMD5) < 5 {
+		return true, nil
+	}
+	file, err := os.Open(filepath)
+	if err != nil {
+		return false, fmt.Errorf("failed to open file: %w", err)
+	}
+	defer func(file *os.File) {
+		_ = file.Close()
+	}(file)
+
+	hash := md5.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return false, fmt.Errorf("failed to compute MD5: %w", err)
+	}
+
+	fileMD5 := hex.EncodeToString(hash.Sum(nil))
+	return strings.EqualFold(fileMD5, expectedMD5), nil
 }

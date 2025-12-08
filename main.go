@@ -35,6 +35,9 @@ func main() {
 		case "gpg":
 			handleGPGCommand()
 			return
+		case "artica":
+			handleArticaCommand()
+			return
 		case "version", "-version", "--version":
 			fmt.Printf("%s v%s\n", AppName, version)
 			os.Exit(0)
@@ -126,6 +129,7 @@ func startDaemon() {
 	httpServer.SetSyncChecker(syncer)
 	httpServer.SetAnalytics(syncer.GetAnalytics())
 	pkgManager := pkgmanager.NewPackageManager(cfg, logger, gpgManager)
+	syncer.SetPackageIndexer(pkgManager) // Enable Artica packages to be added to repository
 	restAPI := api.NewRestAPI(cfg, logger, syncer, httpServer, pkgManager, gpgManager, syncer)
 
 	// Initialiser la base de données des mises à jour de packages
@@ -398,6 +402,8 @@ func printHelp() {
 	fmt.Println("Commands:")
 	fmt.Println("  (none)         Start daemon (default)")
 	fmt.Println("  package        Manage custom packages (see 'package help')")
+	fmt.Println("  artica         Manage Artica packages (see 'artica help')")
+	fmt.Println("  gpg            Manage GPG keys (see 'gpg help')")
 	fmt.Println("  version        Show version")
 	fmt.Println("  help           Show this help")
 	fmt.Println("\nDaemon Options:")

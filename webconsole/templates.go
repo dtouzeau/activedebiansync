@@ -473,6 +473,30 @@ func (wc *WebConsole) renderSettings(w http.ResponseWriter, r *http.Request, ses
 				</table>
 			</div>
 		</div>
+		<div class="card" style="margin-bottom:20px">
+			<div class="card-header">Artica Repository</div>
+			<div class="card-body">
+				<form id="artica-form">
+					<div class="form-group">
+						<label style="display:flex;align-items:center;gap:8px">
+							<input type="checkbox" id="sync_artica_repository"> Enable Artica Repository Sync
+						</label>
+						<small style="display:block;color:#666;margin-top:4px">When enabled, the daemon will download Artica software packages, build .deb packages, and add them to the repository. Clients can then install Artica packages using <code>apt-get install artica-{package}</code></small>
+					</div>
+					<div class="form-group">
+						<label style="display:flex;align-items:center;gap:8px">
+							<input type="checkbox" id="artica_repository_ssl"> Use HTTPS for Artica Repository
+						</label>
+						<small style="display:block;color:#666;margin-top:4px">When enabled, downloads Artica package indexes and files over HTTPS (articatech.com) instead of HTTP (articatech.net). Recommended for secure environments.</small>
+					</div>
+					<div id="artica-status" style="padding:10px;background:#f5f5f5;border-radius:4px;margin-bottom:15px">
+						<strong>Status:</strong> <span id="artica-status-text">-</span><br>
+						<small style="color:#666">Packages are stored in: <code>/home/artica/tmp/deb/</code></small>
+					</div>
+					<button type="submit" class="btn btn-primary">Save Artica Settings</button>
+				</form>
+			</div>
+		</div>
 		<div class="card">
 			<div class="card-header">Web Console SSL</div>
 			<div class="card-body">
@@ -520,6 +544,11 @@ function loadConfig() {
 			document.getElementById('cfg-https-port').textContent = data.https_port || '-';
 			document.getElementById('cfg-api-port').textContent = data.api_port || '-';
 
+			// Artica repository settings
+			document.getElementById('sync_artica_repository').checked = data.sync_artica_repository || false;
+			document.getElementById('artica_repository_ssl').checked = data.artica_repository_ssl || false;
+			updateArticaStatus(data.sync_artica_repository);
+
 			// SSL settings
 			document.getElementById('web_console_https_enabled').checked = data.web_console_https_enabled || false;
 			document.getElementById('web_console_tls_use_server_cert').checked = data.web_console_tls_use_server_cert !== false;
@@ -529,6 +558,15 @@ function loadConfig() {
 
 			updateSSLUI();
 		});
+}
+
+function updateArticaStatus(enabled) {
+	var statusText = document.getElementById('artica-status-text');
+	if (enabled) {
+		statusText.innerHTML = '<span style="color:#4caf50">Enabled</span> - Artica packages will be synced during repository synchronization';
+	} else {
+		statusText.innerHTML = '<span style="color:#9e9e9e">Disabled</span> - Artica packages will not be synced';
+	}
 }
 
 function updateSSLUI() {
@@ -584,6 +622,32 @@ document.getElementById('config-form').addEventListener('submit', function(e) {
 			alert('Failed to save configuration');
 		}
 	});
+});
+
+document.getElementById('artica-form').addEventListener('submit', function(e) {
+	e.preventDefault();
+	var data = {
+		sync_artica_repository: document.getElementById('sync_artica_repository').checked,
+		artica_repository_ssl: document.getElementById('artica_repository_ssl').checked
+	};
+	fetch('/api/console/config/update', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(data)
+	})
+	.then(response => response.json())
+	.then(result => {
+		if (result.status === 'success') {
+			alert('Artica repository settings saved successfully. Changes will take effect on next sync.');
+			loadConfig();
+		} else {
+			alert('Failed to save Artica settings: ' + (result.message || 'Unknown error'));
+		}
+	});
+});
+
+document.getElementById('sync_artica_repository').addEventListener('change', function() {
+	updateArticaStatus(this.checked);
 });
 
 loadConfig();
