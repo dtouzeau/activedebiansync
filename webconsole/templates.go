@@ -784,6 +784,27 @@ func (wc *WebConsole) renderSettings(w http.ResponseWriter, r *http.Request, ses
 						<strong>Note:</strong> Archived releases (buster and older) will automatically use archive.debian.org
 					</small>
 				</div>
+
+				<h4 style="margin:20px 0 15px;padding-top:15px;border-top:1px solid #eee">Translations (i18n)</h4>
+				<div class="form-group">
+					<label style="display:flex;align-items:center;gap:8px">
+						<input type="checkbox" id="sync_translations"> Enable translation file sync
+					</label>
+					<small style="display:block;color:#666;margin-top:4px">Download Translation files for apt package descriptions in different languages</small>
+				</div>
+				<div id="translations-options" style="display:none;margin-left:24px">
+					<div class="form-group">
+						<label>Languages</label>
+						<div id="translations-container" style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:10px"></div>
+						<div style="display:flex;gap:10px;align-items:center">
+							<input type="text" class="form-control" id="new_translation_lang" placeholder="e.g., en, fr, de, es" style="flex:1">
+							<button type="button" class="btn btn-secondary" onclick="addTranslationLang()">Add Language</button>
+						</div>
+						<small style="display:block;color:#666;margin-top:8px">
+							<strong>Common languages:</strong> en (English), fr (French), de (German), es (Spanish), it (Italian), pt (Portuguese), ru (Russian), ja (Japanese), zh (Chinese)
+						</small>
+					</div>
+				</div>
 `
 
 	if isAdmin {
@@ -806,6 +827,9 @@ func (wc *WebConsole) renderSettings(w http.ResponseWriter, r *http.Request, ses
 					<tr><td>Mirror</td><td id="cfg-mirror">-</td></tr>
 					<tr><td>Releases</td><td id="cfg-releases">-</td></tr>
 					<tr><td>Architectures</td><td id="cfg-archs">-</td></tr>
+					<tr><td colspan="2" style="background:#f5f5f5;font-weight:600">Translations</td></tr>
+					<tr><td>Enabled</td><td id="cfg-translations-enabled">-</td></tr>
+					<tr><td>Languages</td><td id="cfg-translations-langs">-</td></tr>
 					<tr><td colspan="2" style="background:#f5f5f5;font-weight:600">Ubuntu</td></tr>
 					<tr><td>Enabled</td><td id="cfg-ubuntu-enabled">-</td></tr>
 					<tr><td>Mirror</td><td id="cfg-ubuntu-mirror">-</td></tr>
@@ -960,6 +984,7 @@ func (wc *WebConsole) renderSettings(w http.ResponseWriter, r *http.Request, ses
 <script>
 var currentReleases = [];
 var currentUbuntuReleases = [];
+var currentTranslationLangs = [];
 
 function loadConfig() {
 	fetch('/api/console/config')
@@ -991,6 +1016,17 @@ function loadConfig() {
 			// Debian releases
 			currentReleases = data.debian_releases || [];
 			renderReleases();
+
+			// Translation settings
+			document.getElementById('sync_translations').checked = data.sync_translations || false;
+			currentTranslationLangs = data.translation_languages || [];
+			renderTranslationLangs();
+			updateTranslationsUI();
+
+			// Translation current settings display
+			document.getElementById('cfg-translations-enabled').innerHTML = data.sync_translations ?
+				'<span style="color:#4caf50">Yes</span>' : '<span style="color:#9e9e9e">No</span>';
+			document.getElementById('cfg-translations-langs').textContent = (data.translation_languages || []).join(', ') || '-';
 
 			// Ubuntu repository settings
 			document.getElementById('sync_ubuntu_repository').checked = data.sync_ubuntu_repository || false;
@@ -1071,6 +1107,50 @@ document.getElementById('new_release').addEventListener('keypress', function(e) 
 	if (e.key === 'Enter') {
 		e.preventDefault();
 		addRelease();
+	}
+});
+
+// Translation functions
+function updateTranslationsUI() {
+	var enabled = document.getElementById('sync_translations').checked;
+	document.getElementById('translations-options').style.display = enabled ? 'block' : 'none';
+}
+
+function renderTranslationLangs() {
+	var container = document.getElementById('translations-container');
+	container.innerHTML = '';
+	currentTranslationLangs.forEach(function(lang) {
+		var badge = document.createElement('span');
+		badge.style.cssText = 'display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;font-size:13px;background:#e8f5e9;color:#2e7d32;border:1px solid #a5d6a7';
+		badge.innerHTML = lang +
+			' <button type="button" onclick="removeTranslationLang(\'' + lang + '\')" style="background:none;border:none;cursor:pointer;padding:0;margin-left:4px;font-size:16px;line-height:1;opacity:0.7">&times;</button>';
+		container.appendChild(badge);
+	});
+	if (currentTranslationLangs.length === 0) {
+		container.innerHTML = '<span style="color:#999;font-style:italic">No languages configured</span>';
+	}
+}
+
+function addTranslationLang() {
+	var input = document.getElementById('new_translation_lang');
+	var lang = input.value.trim().toLowerCase();
+	if (lang && currentTranslationLangs.indexOf(lang) === -1) {
+		currentTranslationLangs.push(lang);
+		renderTranslationLangs();
+		input.value = '';
+	}
+}
+
+function removeTranslationLang(lang) {
+	currentTranslationLangs = currentTranslationLangs.filter(function(l) { return l !== lang; });
+	renderTranslationLangs();
+}
+
+document.getElementById('sync_translations').addEventListener('change', updateTranslationsUI);
+document.getElementById('new_translation_lang').addEventListener('keypress', function(e) {
+	if (e.key === 'Enter') {
+		e.preventDefault();
+		addTranslationLang();
 	}
 });
 
@@ -1223,7 +1303,9 @@ document.getElementById('config-form').addEventListener('submit', function(e) {
 		sync_allowed_hours_enabled: document.getElementById('sync_allowed_hours_enabled').checked,
 		sync_allowed_hours_start: document.getElementById('sync_allowed_hours_start').value,
 		sync_allowed_hours_end: document.getElementById('sync_allowed_hours_end').value,
-		debian_releases: currentReleases
+		debian_releases: currentReleases,
+		sync_translations: document.getElementById('sync_translations').checked,
+		translation_languages: currentTranslationLangs
 	};
 	fetch('/api/console/config/update', {
 		method: 'POST',

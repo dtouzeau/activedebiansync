@@ -57,6 +57,7 @@ type Syncer struct {
 	optimizer      *storage.Optimizer
 	updatesDB      *database.UpdatesDB
 	searchDB       *database.PackageSearchDB
+	eventsDB       *database.EventsDB
 	isRunning      atomic.Bool
 	lastSync       time.Time
 	lastError      error
@@ -327,6 +328,14 @@ func (s *Syncer) doSync(force bool) error {
 		}
 
 		for _, component := range components {
+			// Sync translations for this component (shared across architectures)
+			if cfg.SyncTranslations {
+				s.setActivity("syncing", fmt.Sprintf("Translations: %s/%s", release, component), release, component, 0, 0)
+				if err := s.syncSuiteTranslations(cfg.DebianMirror, release, component); err != nil {
+					s.logger.LogError("Failed to sync translations for %s/%s: %v", release, component, err)
+				}
+			}
+
 			for _, arch := range cfg.DebianArchs {
 				s.setActivity("syncing", fmt.Sprintf("Indexes: %s/%s/%s", release, component, arch), release, component, 0, 0)
 				if err := s.syncReleaseComponent(release, component, arch); err != nil {
@@ -442,7 +451,66 @@ func (s *Syncer) doSync(force bool) error {
 	}
 
 	s.logger.LogInfo("Sync completed in %s", duration)
+
+	// Record sync events to the events database
+	s.recordSyncEvents(duration)
+
 	return syncError
+}
+
+// recordSyncEvents records sync events to the events database for each repository
+func (s *Syncer) recordSyncEvents(duration time.Duration) {
+	if s.eventsDB == nil {
+		return
+	}
+
+	cfg := s.config.Get()
+	durationMs := duration.Milliseconds()
+	totalFiles := atomic.LoadInt64(&s.stats.TotalFiles)
+	totalBytes := atomic.LoadInt64(&s.stats.TotalBytes)
+	failedFiles := atomic.LoadInt64(&s.stats.FailedFiles)
+
+	// Record event for each Debian release that was synced
+	if len(cfg.DebianReleases) > 0 {
+		for _, release := range cfg.DebianReleases {
+			// We record the total stats for the main debian sync
+			// In a more granular implementation, we could track per-release stats
+			if err := s.eventsDB.RecordSyncEvent(totalFiles, totalBytes, "debian/"+release, durationMs, failedFiles); err != nil {
+				s.logger.LogError("Failed to record sync event for debian/%s: %v", release, err)
+			} else {
+				s.logger.LogSync("Recorded sync event for debian/%s", release)
+			}
+		}
+	}
+
+	// Record event for each Ubuntu release that was synced
+	if cfg.SyncUbuntuRepository && len(cfg.UbuntuReleases) > 0 {
+		for _, release := range cfg.UbuntuReleases {
+			if err := s.eventsDB.RecordSyncEvent(totalFiles, totalBytes, "ubuntu/"+release, durationMs, failedFiles); err != nil {
+				s.logger.LogError("Failed to record sync event for ubuntu/%s: %v", release, err)
+			} else {
+				s.logger.LogSync("Recorded sync event for ubuntu/%s", release)
+			}
+		}
+	}
+
+	// Record event for Artica if synced
+	if cfg.SyncArticaRepository {
+		if err := s.eventsDB.RecordSyncEvent(totalFiles, totalBytes, "artica", durationMs, failedFiles); err != nil {
+			s.logger.LogError("Failed to record sync event for artica: %v", err)
+		} else {
+			s.logger.LogSync("Recorded sync event for artica")
+		}
+	}
+
+	// Cleanup old events (run asynchronously to not block)
+	go func() {
+		if deleted, err := s.eventsDB.CleanupOldEvents(15); err != nil {
+			s.logger.LogError("Failed to cleanup old events: %v", err)
+		} else if deleted > 0 {
+			s.logger.LogInfo("Cleaned up %d old sync events (>15 days)", deleted)
+		}
+	}()
 }
 
 // syncReleaseComponent synchronise un composant spécifique d'une release
@@ -599,6 +667,13 @@ func (s *Syncer) syncSuite(mirrorURL, suite string, components, architectures []
 
 	// Sync each component/architecture
 	for _, component := range components {
+		// Sync translations for this component (shared across architectures)
+		if cfg.SyncTranslations {
+			if err := s.syncSuiteTranslations(mirrorURL, suite, component); err != nil {
+				s.logger.LogError("Failed to sync translations for %s/%s: %v", suite, component, err)
+			}
+		}
+
 		for _, arch := range architectures {
 			if err := s.syncSuiteComponent(mirrorURL, suite, component, arch); err != nil {
 				s.logger.LogError("Failed to sync %s/%s/%s: %v", suite, component, arch, err)
@@ -630,6 +705,13 @@ func (s *Syncer) syncSecuritySuite(securityMirror, securitySuite string, compone
 
 	// Sync each component/architecture
 	for _, component := range components {
+		// Sync translations for this component (shared across architectures)
+		if cfg.SyncTranslations {
+			if err := s.syncSuiteTranslations(securityMirror, securitySuite, component); err != nil {
+				s.logger.LogError("Failed to sync security translations for %s/%s: %v", securitySuite, component, err)
+			}
+		}
+
 		for _, arch := range architectures {
 			if err := s.syncSuiteComponent(securityMirror, securitySuite, component, arch); err != nil {
 				s.logger.LogError("Failed to sync security %s/%s/%s: %v", securitySuite, component, arch, err)
@@ -715,6 +797,60 @@ func (s *Syncer) syncSuiteComponent(mirrorURL, suite, component, arch string) er
 	// We need at least one Packages file (.gz or .xz)
 	if successCount == 0 {
 		return fmt.Errorf("failed to download any index files for %s/%s/%s", suite, component, arch)
+	}
+
+	return nil
+}
+
+// syncSuiteTranslations downloads Translation files (i18n) for a suite component
+func (s *Syncer) syncSuiteTranslations(mirrorURL, suite, component string) error {
+	cfg := s.config.Get()
+
+	// Check if translations are enabled
+	if !cfg.SyncTranslations || len(cfg.TranslationLanguages) == 0 {
+		return nil
+	}
+
+	remoteBase := fmt.Sprintf("%s/dists/%s/%s/i18n", mirrorURL, suite, component)
+	localBase := filepath.Join(cfg.RepositoryPath, "dists", suite, component, "i18n")
+
+	// Create i18n directory
+	if err := os.MkdirAll(localBase, 0755); err != nil {
+		return fmt.Errorf("failed to create i18n directory: %w", err)
+	}
+
+	// Download Translation files for each configured language
+	downloadedCount := 0
+	for _, lang := range cfg.TranslationLanguages {
+		// Try different compression formats - prefer xz, then bz2, then gz, then uncompressed
+		formats := []string{
+			fmt.Sprintf("Translation-%s.xz", lang),
+			fmt.Sprintf("Translation-%s.bz2", lang),
+			fmt.Sprintf("Translation-%s.gz", lang),
+			fmt.Sprintf("Translation-%s", lang),
+		}
+
+		downloaded := false
+		for _, filename := range formats {
+			remoteURL := fmt.Sprintf("%s/%s", remoteBase, filename)
+			localPath := filepath.Join(localBase, filename)
+
+			if err := s.downloadFileResume(remoteURL, localPath); err == nil {
+				s.logger.LogSync("Downloaded: %s/%s/i18n/%s", suite, component, filename)
+				downloadedCount++
+				downloaded = true
+				break // Only need one format per language
+			}
+		}
+
+		if !downloaded {
+			// Not all languages exist for all components, this is normal
+			s.logger.LogSync("Translation-%s not available for %s/%s (skipped)", lang, suite, component)
+		}
+	}
+
+	if downloadedCount > 0 {
+		s.logger.LogSync("Downloaded %d translation files for %s/%s", downloadedCount, suite, component)
 	}
 
 	return nil
@@ -1200,6 +1336,16 @@ func (s *Syncer) SetSearchDB(db *database.PackageSearchDB) {
 // GetSearchDB retourne la base de données de recherche de packages
 func (s *Syncer) GetSearchDB() *database.PackageSearchDB {
 	return s.searchDB
+}
+
+// SetEventsDB définit la base de données des événements de synchronisation
+func (s *Syncer) SetEventsDB(db *database.EventsDB) {
+	s.eventsDB = db
+}
+
+// GetEventsDB retourne la base de données des événements de synchronisation
+func (s *Syncer) GetEventsDB() *database.EventsDB {
+	return s.eventsDB
 }
 
 // SetPackageIndexer définit le gestionnaire d'index de packages

@@ -67,6 +67,10 @@ type Config struct {
 	SyncInstallerImages bool     `json:"sync_installer_images"` // Télécharger les images d'installation (netboot, hd-media, cdrom)
 	InstallerImageTypes []string `json:"installer_image_types"` // Types d'images à télécharger ["netboot", "hd-media", "cdrom"]
 
+	// Paramètres de traductions (i18n)
+	SyncTranslations     bool     `json:"sync_translations"`     // Activer la synchronisation des fichiers de traduction
+	TranslationLanguages []string `json:"translation_languages"` // Langues à synchroniser ["en", "fr", "de", "es", etc.]
+
 	// Paramètres avancés de synchronisation
 	MaxConcurrentDownloads  int    `json:"max_concurrent_downloads"`   // Nombre de téléchargements parallèles (défaut: 4)
 	DownloadBandwidthLimit  int    `json:"download_bandwidth_limit"`   // Limite en KB/s (0 = illimité)
