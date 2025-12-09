@@ -61,6 +61,7 @@ type Syncer struct {
 	lastSync       time.Time
 	lastError      error
 	stats          *SyncStats
+	activity       *SyncActivity
 	rateLimiter    *utils.RateLimiter
 	mu             sync.RWMutex
 	stopChan       chan struct{}
@@ -88,16 +89,45 @@ type DownloadResult struct {
 	Error error
 }
 
+// FailedFile represents a file that failed to download
+type FailedFile struct {
+	URL       string    `json:"url"`
+	LocalPath string    `json:"local_path"`
+	Error     string    `json:"error"`
+	Timestamp time.Time `json:"timestamp"`
+	Suite     string    `json:"suite,omitempty"`
+	Component string    `json:"component,omitempty"`
+}
+
+// SyncActivity represents the current sync activity
+type SyncActivity struct {
+	Action       string    `json:"action"`        // e.g., "downloading", "verifying", "indexing"
+	File         string    `json:"file"`          // Current file being processed
+	Suite        string    `json:"suite"`         // Current suite (e.g., "bookworm")
+	Component    string    `json:"component"`     // Current component (e.g., "main")
+	Progress     int       `json:"progress"`      // Progress percentage (0-100)
+	BytesDone    int64     `json:"bytes_done"`    // Bytes downloaded in current session
+	FilesCount   int       `json:"files_count"`   // Total files to process in current batch
+	FilesDone    int       `json:"files_done"`    // Files completed in current batch
+	SessionFiles int64     `json:"session_files"` // Total files downloaded in this sync session
+	SessionBytes int64     `json:"session_bytes"` // Total bytes downloaded in this sync session
+	Timestamp    time.Time `json:"timestamp"`     // When this activity was recorded
+	mu           sync.RWMutex
+}
+
 // SyncStats contient les statistiques de synchronisation
 type SyncStats struct {
-	TotalFiles       int64     `json:"total_files"`
-	TotalBytes       int64     `json:"total_bytes"`
-	FailedFiles      int64     `json:"failed_files"`
-	LastSyncStart    time.Time `json:"last_sync_start"`
-	LastSyncEnd      time.Time `json:"last_sync_end"`
-	LastSyncDuration string    `json:"last_sync_duration"`
-	IsRunning        bool      `json:"is_running"`
-	LastError        string    `json:"last_error,omitempty"`
+	TotalFiles       int64        `json:"total_files"`
+	TotalBytes       int64        `json:"total_bytes"`
+	FailedFiles      int64        `json:"failed_files"`
+	FailedFilesList  []FailedFile `json:"failed_files_list,omitempty"`
+	LastSyncStart    time.Time    `json:"last_sync_start"`
+	LastSyncEnd      time.Time    `json:"last_sync_end"`
+	LastSyncDuration string       `json:"last_sync_duration"`
+	IsRunning        bool         `json:"is_running"`
+	LastError        string       `json:"last_error,omitempty"`
+	DiskError        bool         `json:"disk_error"`
+	DiskErrorMessage string       `json:"disk_error_message,omitempty"`
 	mu               sync.RWMutex
 }
 
@@ -160,6 +190,7 @@ func NewSyncer(cfg *config.Config, logger *utils.Logger, gpgManager GPGSigner) *
 		analytics:     analytics,
 		optimizer:     optimizer,
 		stats:         &SyncStats{},
+		activity:      &SyncActivity{},
 		rateLimiter:   utils.NewRateLimiter(bandwidthLimit),
 		stopChan:      make(chan struct{}),
 		stoppedChan:   make(chan struct{}),
@@ -204,15 +235,29 @@ func (s *Syncer) Stop() {
 	<-s.stoppedChan
 }
 
+// ForceSync triggers an immediate sync, bypassing time restrictions
+func (s *Syncer) ForceSync() error {
+	return s.doSync(true)
+}
+
 // Sync effectue une synchronisation complète
 func (s *Syncer) Sync() error {
+	return s.doSync(false)
+}
+
+// doSync is the internal sync method that performs the actual synchronization
+func (s *Syncer) doSync(force bool) error {
 	if s.isRunning.Load() {
 		s.logger.LogInfo("Sync already in progress, skipping")
 		return fmt.Errorf("sync already in progress")
 	}
 
-	// Vérifier si on est dans la plage horaire autorisée
-	s.waitForAllowedHours()
+	// Vérifier si on est dans la plage horaire autorisée (skip if forced)
+	if !force {
+		s.waitForAllowedHours()
+	} else {
+		s.logger.LogInfo("Forced sync requested, bypassing time restrictions")
+	}
 
 	s.isRunning.Store(true)
 	defer s.isRunning.Store(false)
@@ -239,6 +284,8 @@ func (s *Syncer) Sync() error {
 			diskInfo.UsedPercent, cfg.MaxDiskUsagePercent)
 		s.stats.mu.Lock()
 		s.stats.LastError = fmt.Sprintf("Disk space exceeded: %.2f%%", diskInfo.UsedPercent)
+		s.stats.DiskError = true
+		s.stats.DiskErrorMessage = fmt.Sprintf("Disk usage (%.2f%%) exceeds maximum allowed (%d%%)", diskInfo.UsedPercent, cfg.MaxDiskUsagePercent)
 		s.stats.mu.Unlock()
 		return fmt.Errorf("disk space exceeded")
 	}
@@ -250,6 +297,10 @@ func (s *Syncer) Sync() error {
 	s.stats.LastSyncStart = startTime
 	s.stats.IsRunning = true
 	s.stats.LastError = ""
+	s.stats.FailedFiles = 0
+	s.stats.FailedFilesList = nil // Clear previous failed files
+	s.stats.DiskError = false     // Clear disk error on successful sync start
+	s.stats.DiskErrorMessage = ""
 	s.stats.mu.Unlock()
 
 	// Créer le répertoire du dépôt si nécessaire
@@ -261,6 +312,7 @@ func (s *Syncer) Sync() error {
 	var syncError error
 
 	// Synchroniser d'abord les fichiers Release pour permettre la validation d'intégrité
+	s.setActivity("syncing", "Release metadata", "", "", 0, 0)
 	s.syncMetadata()
 
 	// Synchroniser chaque release
@@ -276,14 +328,17 @@ func (s *Syncer) Sync() error {
 
 		for _, component := range components {
 			for _, arch := range cfg.DebianArchs {
+				s.setActivity("syncing", fmt.Sprintf("Indexes: %s/%s/%s", release, component, arch), release, component, 0, 0)
 				if err := s.syncReleaseComponent(release, component, arch); err != nil {
 					s.logger.LogError("Failed to sync %s/%s/%s: %v", release, component, arch, err)
 					syncError = err
 					atomic.AddInt64(&s.stats.FailedFiles, 1)
+					s.recordFailedFile("", "", err.Error(), release, component)
 				}
 
 				// Télécharger les packages .deb si activé
 				if cfg.SyncPackages {
+					s.setActivity("downloading", fmt.Sprintf("Packages: %s/%s/%s", release, component, arch), release, component, 0, 0)
 					if err := s.syncPackages(release, component, arch); err != nil {
 						s.logger.LogError("Failed to sync packages for %s/%s/%s: %v", release, component, arch, err)
 						syncError = err
@@ -291,13 +346,17 @@ func (s *Syncer) Sync() error {
 				}
 
 				// Vérifier l'espace disque à chaque itération
-				exceeded, _, err := utils.CheckDiskSpace(cfg.RepositoryPath, cfg.MaxDiskUsagePercent)
+				exceeded, diskInfoCheck, err := utils.CheckDiskSpace(cfg.RepositoryPath, cfg.MaxDiskUsagePercent)
 				if err != nil {
 					s.logger.LogError("Failed to check disk space: %v", err)
 					continue
 				}
 				if exceeded {
 					s.logger.LogError("Disk space limit reached during sync, stopping")
+					s.stats.mu.Lock()
+					s.stats.DiskError = true
+					s.stats.DiskErrorMessage = fmt.Sprintf("Disk usage (%.2f%%) exceeds maximum allowed (%d%%)", diskInfoCheck.UsedPercent, cfg.MaxDiskUsagePercent)
+					s.stats.mu.Unlock()
 					syncError = fmt.Errorf("disk space exceeded during sync")
 					break
 				}
@@ -332,6 +391,11 @@ func (s *Syncer) Sync() error {
 		s.SyncArticaCores()
 	}
 
+	// Synchroniser les dépôts Ubuntu si activé
+	if cfg.SyncUbuntuRepository && len(cfg.UbuntuReleases) > 0 {
+		s.syncUbuntuRepository()
+	}
+
 	// Signer tous les fichiers Release avec GPG si activé
 	if s.gpgManager != nil && s.gpgManager.IsEnabled() && syncError == nil {
 		s.logger.LogInfo("Signing all Release files with GPG...")
@@ -345,6 +409,9 @@ func (s *Syncer) Sync() error {
 
 	endTime := time.Now()
 	duration := endTime.Sub(startTime)
+
+	// Clear activity when sync is done
+	s.clearActivity()
 
 	s.stats.mu.Lock()
 	s.stats.LastSyncEnd = endTime
@@ -449,6 +516,7 @@ func (s *Syncer) syncReleaseComponent(release, component, arch string) error {
 		if result.Error != nil {
 			s.logger.LogError("Failed to download %s: %v", result.Job.URL, result.Error)
 			atomic.AddInt64(&s.stats.FailedFiles, 1)
+			s.recordFailedFile(result.Job.URL, result.Job.LocalPath, result.Error.Error(), release, component)
 			hasError = true
 			lastError = result.Error
 		} else {
@@ -635,16 +703,16 @@ func (s *Syncer) syncSuiteComponent(mirrorURL, suite, component, arch string) er
 		localPath := filepath.Join(localBase, target)
 
 		if err := s.downloadFileResume(remoteURL, localPath); err != nil {
-			// Packages.xz may not exist on older archives
-			if !strings.Contains(target, ".xz") {
-				s.logger.LogError("Failed to download %s/%s/%s: %v", suite, component, target, err)
-			}
+			// Packages.gz may not exist on security repos (only .xz), and
+			// Packages.xz may not exist on older archives. Only log at debug level.
+			// The Release file is also optional in some cases.
 			continue
 		}
 		s.logger.LogSync("Downloaded: %s/%s/%s", suite, component, target)
 		successCount++
 	}
 
+	// We need at least one Packages file (.gz or .xz)
 	if successCount == 0 {
 		return fmt.Errorf("failed to download any index files for %s/%s/%s", suite, component, arch)
 	}
@@ -656,14 +724,21 @@ func (s *Syncer) syncSuiteComponent(mirrorURL, suite, component, arch string) er
 func (s *Syncer) syncSuitePackages(mirrorURL, suite, component, arch string) error {
 	cfg := s.config.Get()
 
-	// Find Packages file
-	packagesPath := filepath.Join(cfg.RepositoryPath, "dists", suite, component, fmt.Sprintf("binary-%s", arch), "Packages.gz")
-	if _, err := os.Stat(packagesPath); os.IsNotExist(err) {
-		packagesPath = filepath.Join(cfg.RepositoryPath, "dists", suite, component, fmt.Sprintf("binary-%s", arch), "Packages.xz")
-		if _, err := os.Stat(packagesPath); os.IsNotExist(err) {
-			s.logger.LogInfo("No Packages file found for %s/%s/%s, skipping package sync", suite, component, arch)
-			return nil
-		}
+	// Find Packages file - prefer .xz as it's more commonly available now
+	// Check that file exists AND has content (size > 0)
+	packagesPath := ""
+	xzPath := filepath.Join(cfg.RepositoryPath, "dists", suite, component, fmt.Sprintf("binary-%s", arch), "Packages.xz")
+	gzPath := filepath.Join(cfg.RepositoryPath, "dists", suite, component, fmt.Sprintf("binary-%s", arch), "Packages.gz")
+
+	if stat, err := os.Stat(xzPath); err == nil && stat.Size() > 0 {
+		packagesPath = xzPath
+	} else if stat, err := os.Stat(gzPath); err == nil && stat.Size() > 0 {
+		packagesPath = gzPath
+	}
+
+	if packagesPath == "" {
+		s.logger.LogInfo("No valid Packages file found for %s/%s/%s, skipping package sync", suite, component, arch)
+		return nil
 	}
 
 	// Parse Packages file
@@ -913,6 +988,7 @@ func (s *Syncer) downloadFileResumeWithValidation(url, destPath, releaseName, re
 	}
 
 	atomic.AddInt64(&s.stats.TotalBytes, written)
+	s.addSessionDownload(written)
 
 	// Validation d'intégrité si activée et si on a les informations de release
 	if cfg.IntegrityCheckEnabled && releaseName != "" && relativePath != "" {
@@ -939,7 +1015,7 @@ func (s *Syncer) GetStats() *SyncStats {
 	defer s.stats.mu.RUnlock()
 
 	// Créer une copie
-	return &SyncStats{
+	stats := &SyncStats{
 		TotalFiles:       atomic.LoadInt64(&s.stats.TotalFiles),
 		TotalBytes:       atomic.LoadInt64(&s.stats.TotalBytes),
 		FailedFiles:      atomic.LoadInt64(&s.stats.FailedFiles),
@@ -948,6 +1024,117 @@ func (s *Syncer) GetStats() *SyncStats {
 		LastSyncDuration: s.stats.LastSyncDuration,
 		IsRunning:        s.isRunning.Load(),
 		LastError:        s.stats.LastError,
+		DiskError:        s.stats.DiskError,
+		DiskErrorMessage: s.stats.DiskErrorMessage,
+	}
+
+	// Copy failed files list
+	if len(s.stats.FailedFilesList) > 0 {
+		stats.FailedFilesList = make([]FailedFile, len(s.stats.FailedFilesList))
+		copy(stats.FailedFilesList, s.stats.FailedFilesList)
+	}
+
+	return stats
+}
+
+// recordFailedFile adds a failed file to the stats
+func (s *Syncer) recordFailedFile(url, localPath, errMsg, suite, component string) {
+	s.stats.mu.Lock()
+	defer s.stats.mu.Unlock()
+
+	// Limit the number of recorded failures to prevent memory issues
+	const maxFailedFiles = 1000
+	if len(s.stats.FailedFilesList) < maxFailedFiles {
+		s.stats.FailedFilesList = append(s.stats.FailedFilesList, FailedFile{
+			URL:       url,
+			LocalPath: localPath,
+			Error:     errMsg,
+			Timestamp: time.Now(),
+			Suite:     suite,
+			Component: component,
+		})
+	}
+}
+
+// GetFailedFiles returns the list of failed files from the last sync
+func (s *Syncer) GetFailedFiles() []FailedFile {
+	s.stats.mu.RLock()
+	defer s.stats.mu.RUnlock()
+
+	if len(s.stats.FailedFilesList) == 0 {
+		return nil
+	}
+
+	result := make([]FailedFile, len(s.stats.FailedFilesList))
+	copy(result, s.stats.FailedFilesList)
+	return result
+}
+
+// setActivity updates the current sync activity
+func (s *Syncer) setActivity(action, file, suite, component string, filesCount, filesDone int) {
+	s.activity.mu.Lock()
+	defer s.activity.mu.Unlock()
+
+	s.activity.Action = action
+	s.activity.File = file
+	s.activity.Suite = suite
+	s.activity.Component = component
+	s.activity.FilesCount = filesCount
+	s.activity.FilesDone = filesDone
+	if filesCount > 0 {
+		s.activity.Progress = (filesDone * 100) / filesCount
+	} else {
+		s.activity.Progress = 0
+	}
+	s.activity.Timestamp = time.Now()
+}
+
+// clearActivity clears the current activity when sync is done
+func (s *Syncer) clearActivity() {
+	s.activity.mu.Lock()
+	defer s.activity.mu.Unlock()
+
+	s.activity.Action = ""
+	s.activity.File = ""
+	s.activity.Suite = ""
+	s.activity.Component = ""
+	s.activity.Progress = 0
+	s.activity.FilesCount = 0
+	s.activity.FilesDone = 0
+	s.activity.BytesDone = 0
+	s.activity.SessionFiles = 0
+	s.activity.SessionBytes = 0
+}
+
+// addSessionDownload increments session download counters
+func (s *Syncer) addSessionDownload(bytes int64) {
+	s.activity.mu.Lock()
+	defer s.activity.mu.Unlock()
+	s.activity.SessionFiles++
+	s.activity.SessionBytes += bytes
+}
+
+// GetActivity returns a copy of the current sync activity
+func (s *Syncer) GetActivity() *SyncActivity {
+	s.activity.mu.RLock()
+	defer s.activity.mu.RUnlock()
+
+	if !s.isRunning.Load() {
+		return nil
+	}
+
+	return &SyncActivity{
+		Action:       s.activity.Action,
+		File:         s.activity.File,
+		Suite:        s.activity.Suite,
+		Component:    s.activity.Component,
+		Progress:     s.activity.Progress,
+		BytesDone:    s.activity.BytesDone,
+		FilesCount:   s.activity.FilesCount,
+		FilesDone:    s.activity.FilesDone,
+		SessionFiles: s.activity.SessionFiles,
+		SessionBytes: s.activity.SessionBytes,
+		Timestamp:    s.activity.Timestamp,
 	}
 }
 
@@ -1122,6 +1309,10 @@ func (s *Syncer) downloadWorker(jobs <-chan DownloadJob, results chan<- Download
 	defer wg.Done()
 
 	for job := range jobs {
+		// Extract filename from path for display
+		filename := filepath.Base(job.LocalPath)
+		s.setActivity("downloading", filename, job.ReleaseName, job.Component, 0, 0)
+
 		err := s.downloadFileResumeWithValidation(job.URL, job.LocalPath, job.ReleaseName, job.RelativePath)
 		results <- DownloadResult{
 			Job:   job,
@@ -2347,6 +2538,7 @@ func (s *Syncer) DownloadPackage(Params articarepos.ArticaDownloader) error {
 		return fmt.Errorf("failed to rename temp file: %w", err)
 	}
 	atomic.AddInt64(&s.stats.TotalBytes, written)
+	s.addSessionDownload(written)
 	return nil
 }
 func (s *Syncer) downloadArticaPackage(soft articarepos.ArticaSoft) error {
@@ -2415,6 +2607,7 @@ func (s *Syncer) downloadArticaPackage(soft articarepos.ArticaSoft) error {
 		return fmt.Errorf("failed to rename temp file: %w", err)
 	}
 	atomic.AddInt64(&s.stats.TotalBytes, written)
+	s.addSessionDownload(written)
 	return nil
 }
 func (s *Syncer) verifyArticaFile(filepath string, expectedMD5 string, expectedSize int64) (bool, error) {
@@ -2446,4 +2639,523 @@ func (s *Syncer) verifyArticaFile(filepath string, expectedMD5 string, expectedS
 
 	fileMD5 := hex.EncodeToString(hash.Sum(nil))
 	return strings.EqualFold(fileMD5, expectedMD5), nil
+}
+
+// ==================== Ubuntu Repository Sync ====================
+
+// syncUbuntuRepository synchronizes Ubuntu repositories
+func (s *Syncer) syncUbuntuRepository() {
+	cfg := s.config.Get()
+	s.logger.LogInfo("Starting Ubuntu repository synchronization")
+
+	// Sync each configured Ubuntu release
+	for _, releaseName := range cfg.UbuntuReleases {
+		releaseConfig := s.config.GetUbuntuReleaseConfig(releaseName)
+		s.logger.LogInfo("Syncing Ubuntu release: %s (LTS: %v, Archived: %v)",
+			releaseName, releaseConfig.IsLTS, releaseConfig.IsArchived)
+
+		// Determine components to sync for this release
+		components := cfg.UbuntuComponents
+		if len(releaseConfig.Components) > 0 {
+			components = releaseConfig.Components
+		}
+
+		// Sync metadata for the main release
+		if err := s.syncUbuntuReleaseMetadata(releaseConfig, releaseName); err != nil {
+			s.logger.LogError("Failed to sync Ubuntu metadata for %s: %v", releaseName, err)
+		}
+
+		// Sync each component/architecture combination
+		for _, component := range components {
+			for _, arch := range cfg.UbuntuArchs {
+				s.setActivity("syncing", fmt.Sprintf("Ubuntu: %s/%s/%s", releaseName, component, arch), releaseName, component, 0, 0)
+				if err := s.syncUbuntuReleaseComponent(releaseConfig, releaseName, component, arch); err != nil {
+					s.logger.LogError("Failed to sync Ubuntu %s/%s/%s: %v", releaseName, component, arch, err)
+					atomic.AddInt64(&s.stats.FailedFiles, 1)
+					s.recordFailedFile("", "", err.Error(), releaseName, component)
+				}
+
+				// Download packages if enabled
+				if cfg.SyncPackages {
+					s.setActivity("downloading", fmt.Sprintf("Ubuntu packages: %s/%s/%s", releaseName, component, arch), releaseName, component, 0, 0)
+					if err := s.syncUbuntuPackages(releaseConfig, releaseName, component, arch); err != nil {
+						s.logger.LogError("Failed to sync Ubuntu packages for %s/%s/%s: %v", releaseName, component, arch, err)
+					}
+				}
+
+				// Check disk space
+				exceeded, _, err := utils.CheckDiskSpace(cfg.RepositoryPath, cfg.MaxDiskUsagePercent)
+				if err != nil {
+					s.logger.LogError("Failed to check disk space: %v", err)
+				}
+				if exceeded {
+					s.logger.LogError("Disk space limit reached during Ubuntu sync, stopping")
+					return
+				}
+			}
+		}
+
+		// Sync additional pockets (-updates, -backports, -security, -proposed)
+		if err := s.syncUbuntuAdditionalPockets(releaseConfig, releaseName, components); err != nil {
+			s.logger.LogError("Failed to sync Ubuntu additional pockets for %s: %v", releaseName, err)
+		}
+	}
+
+	s.logger.LogInfo("Ubuntu repository synchronization completed")
+}
+
+// syncUbuntuReleaseMetadata downloads Release, Release.gpg, InRelease files for an Ubuntu release
+func (s *Syncer) syncUbuntuReleaseMetadata(releaseConfig config.UbuntuReleaseConfig, releaseName string) error {
+	cfg := s.config.Get()
+
+	mirrorURL := releaseConfig.Mirror
+	if mirrorURL == "" {
+		mirrorURL = cfg.UbuntuMirror
+	}
+
+	remoteBase := fmt.Sprintf("%s/dists/%s", mirrorURL, releaseName)
+	localBase := filepath.Join(cfg.RepositoryPath, "ubuntu", "dists", releaseName)
+
+	if err := os.MkdirAll(localBase, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", localBase, err)
+	}
+
+	metadataFiles := []string{"Release", "Release.gpg", "InRelease"}
+	for _, file := range metadataFiles {
+		remoteURL := fmt.Sprintf("%s/%s", remoteBase, file)
+		localPath := filepath.Join(localBase, file)
+
+		if err := s.downloadFileResume(remoteURL, localPath); err != nil {
+			if file != "Release.gpg" {
+				s.logger.LogError("Failed to download Ubuntu %s/%s: %v", releaseName, file, err)
+			}
+			continue
+		}
+		s.logger.LogSync("Downloaded Ubuntu metadata: %s/%s", releaseName, file)
+		atomic.AddInt64(&s.stats.TotalFiles, 1)
+	}
+
+	return nil
+}
+
+// syncUbuntuReleaseComponent downloads Packages index files for an Ubuntu component
+func (s *Syncer) syncUbuntuReleaseComponent(releaseConfig config.UbuntuReleaseConfig, releaseName, component, arch string) error {
+	cfg := s.config.Get()
+
+	mirrorURL := releaseConfig.Mirror
+	if mirrorURL == "" {
+		mirrorURL = cfg.UbuntuMirror
+	}
+
+	remoteBase := fmt.Sprintf("%s/dists/%s/%s", mirrorURL, releaseName, component)
+	localBase := filepath.Join(cfg.RepositoryPath, "ubuntu", "dists", releaseName, component)
+
+	// Create directory for binary-<arch>
+	binaryDir := filepath.Join(localBase, fmt.Sprintf("binary-%s", arch))
+	if err := os.MkdirAll(binaryDir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	// Download Packages index files
+	targets := []string{
+		fmt.Sprintf("binary-%s/Packages.gz", arch),
+		fmt.Sprintf("binary-%s/Packages.xz", arch),
+		fmt.Sprintf("binary-%s/Release", arch),
+	}
+
+	var jobs []DownloadJob
+	for _, target := range targets {
+		relativePath := fmt.Sprintf("%s/%s", component, target)
+		jobs = append(jobs, DownloadJob{
+			URL:          fmt.Sprintf("%s/%s", remoteBase, target),
+			LocalPath:    filepath.Join(localBase, target),
+			ReleaseName:  releaseName,
+			RelativePath: relativePath,
+		})
+	}
+
+	results := s.downloadFilesParallel(jobs)
+
+	successCount := 0
+	for _, result := range results {
+		if result.Error != nil {
+			// Don't log errors for optional files
+			continue
+		}
+		s.logger.LogSync("Downloaded Ubuntu: %s/%s/%s", releaseName, component, arch)
+		atomic.AddInt64(&s.stats.TotalFiles, 1)
+		successCount++
+	}
+
+	if successCount == 0 {
+		return fmt.Errorf("failed to download any index files for Ubuntu %s/%s/%s", releaseName, component, arch)
+	}
+
+	return nil
+}
+
+// syncUbuntuPackages downloads .deb packages for an Ubuntu release based on its Packages index
+func (s *Syncer) syncUbuntuPackages(releaseConfig config.UbuntuReleaseConfig, releaseName, component, arch string) error {
+	cfg := s.config.Get()
+
+	mirrorURL := releaseConfig.Mirror
+	if mirrorURL == "" {
+		mirrorURL = cfg.UbuntuMirror
+	}
+
+	// Find Packages file - prefer .xz as it's more commonly available now
+	packagesPath := ""
+	xzPath := filepath.Join(cfg.RepositoryPath, "ubuntu", "dists", releaseName, component, fmt.Sprintf("binary-%s", arch), "Packages.xz")
+	gzPath := filepath.Join(cfg.RepositoryPath, "ubuntu", "dists", releaseName, component, fmt.Sprintf("binary-%s", arch), "Packages.gz")
+
+	if stat, err := os.Stat(xzPath); err == nil && stat.Size() > 0 {
+		packagesPath = xzPath
+	} else if stat, err := os.Stat(gzPath); err == nil && stat.Size() > 0 {
+		packagesPath = gzPath
+	}
+
+	if packagesPath == "" {
+		s.logger.LogInfo("No valid Packages file found for Ubuntu %s/%s/%s, skipping package sync", releaseName, component, arch)
+		return nil
+	}
+
+	// Parse Packages file
+	packages, err := s.parsePackagesFile(packagesPath)
+	if err != nil {
+		return fmt.Errorf("failed to parse Ubuntu Packages file: %w", err)
+	}
+
+	if len(packages) == 0 {
+		s.logger.LogInfo("No packages found in Ubuntu %s/%s/%s", releaseName, component, arch)
+		return nil
+	}
+
+	s.logger.LogInfo("Found %d packages in Ubuntu %s/%s/%s", len(packages), releaseName, component, arch)
+
+	// Create download jobs
+	var jobs []DownloadJob
+	for _, pkg := range packages {
+		// Ubuntu uses pool/ structure like Debian
+		localPath := filepath.Join(cfg.RepositoryPath, "ubuntu", pkg.Filename)
+
+		// Check if file already exists with correct size
+		if stat, err := os.Stat(localPath); err == nil {
+			if stat.Size() == pkg.Size {
+				continue
+			}
+		}
+
+		jobs = append(jobs, DownloadJob{
+			URL:                fmt.Sprintf("%s/%s", mirrorURL, pkg.Filename),
+			LocalPath:          localPath,
+			ReleaseName:        releaseName,
+			RelativePath:       pkg.Filename,
+			PackageName:        pkg.Package,
+			PackageVersion:     pkg.Version,
+			PackageDescription: pkg.Description,
+			PackageSize:        pkg.Size,
+			Component:          component,
+			Architecture:       arch,
+		})
+	}
+
+	if len(jobs) == 0 {
+		s.logger.LogInfo("All Ubuntu packages up to date for %s/%s/%s", releaseName, component, arch)
+		return nil
+	}
+
+	s.logger.LogInfo("Downloading %d Ubuntu packages for %s/%s/%s", len(jobs), releaseName, component, arch)
+
+	// Download in batches
+	batchSize := 100
+	for i := 0; i < len(jobs); i += batchSize {
+		end := i + batchSize
+		if end > len(jobs) {
+			end = len(jobs)
+		}
+
+		batch := jobs[i:end]
+		results := s.downloadFilesParallel(batch)
+
+		for _, result := range results {
+			if result.Error != nil {
+				s.logger.LogError("Failed to download Ubuntu package %s: %v", result.Job.URL, result.Error)
+				atomic.AddInt64(&s.stats.FailedFiles, 1)
+			} else {
+				atomic.AddInt64(&s.stats.TotalFiles, 1)
+			}
+		}
+
+		// Check disk space
+		exceeded, _, err := utils.CheckDiskSpace(cfg.RepositoryPath, cfg.MaxDiskUsagePercent)
+		if err != nil {
+			s.logger.LogError("Failed to check disk space: %v", err)
+		}
+		if exceeded {
+			s.logger.LogError("Disk space limit reached during Ubuntu package sync, stopping")
+			return fmt.Errorf("disk space exceeded")
+		}
+	}
+
+	return nil
+}
+
+// syncUbuntuAdditionalPockets syncs -updates, -backports, -security, -proposed pockets
+func (s *Syncer) syncUbuntuAdditionalPockets(releaseConfig config.UbuntuReleaseConfig, releaseName string, components []string) error {
+	cfg := s.config.Get()
+	var syncError error
+
+	mirrorURL := releaseConfig.Mirror
+	if mirrorURL == "" {
+		mirrorURL = cfg.UbuntuMirror
+	}
+
+	// Ubuntu pocket suffixes (similar to Debian suites)
+	// -updates: Regular updates
+	// -security: Security updates
+	// -backports: Backported packages from newer releases
+	// -proposed: Pre-release updates (testing)
+
+	// Sync -updates pocket if enabled
+	if releaseConfig.SyncUpdates {
+		updatesPocket := releaseName + "-updates"
+		s.logger.LogInfo("Syncing Ubuntu updates pocket: %s", updatesPocket)
+		if err := s.syncUbuntuPocket(mirrorURL, updatesPocket, components, cfg.UbuntuArchs); err != nil {
+			s.logger.LogError("Failed to sync Ubuntu updates for %s: %v", releaseName, err)
+			syncError = err
+		}
+	}
+
+	// Sync -security pocket if enabled
+	if releaseConfig.SyncSecurity {
+		securityPocket := releaseName + "-security"
+		// Security updates may come from a different mirror (security.ubuntu.com)
+		securityMirror := mirrorURL
+		if !releaseConfig.IsArchived {
+			securityMirror = "http://security.ubuntu.com/ubuntu"
+		}
+		s.logger.LogInfo("Syncing Ubuntu security pocket: %s from %s", securityPocket, securityMirror)
+		if err := s.syncUbuntuPocket(securityMirror, securityPocket, components, cfg.UbuntuArchs); err != nil {
+			s.logger.LogError("Failed to sync Ubuntu security for %s: %v", releaseName, err)
+			syncError = err
+		}
+	}
+
+	// Sync -backports pocket if enabled
+	if releaseConfig.SyncBackports {
+		backportsPocket := releaseName + "-backports"
+		s.logger.LogInfo("Syncing Ubuntu backports pocket: %s", backportsPocket)
+		if err := s.syncUbuntuPocket(mirrorURL, backportsPocket, components, cfg.UbuntuArchs); err != nil {
+			s.logger.LogError("Failed to sync Ubuntu backports for %s: %v", releaseName, err)
+			syncError = err
+		}
+	}
+
+	// Sync -proposed pocket if enabled (usually disabled for production)
+	if releaseConfig.SyncProposed {
+		proposedPocket := releaseName + "-proposed"
+		s.logger.LogInfo("Syncing Ubuntu proposed pocket: %s", proposedPocket)
+		if err := s.syncUbuntuPocket(mirrorURL, proposedPocket, components, cfg.UbuntuArchs); err != nil {
+			s.logger.LogError("Failed to sync Ubuntu proposed for %s: %v", releaseName, err)
+			syncError = err
+		}
+	}
+
+	return syncError
+}
+
+// syncUbuntuPocket syncs a specific Ubuntu pocket (e.g., jammy-updates, jammy-security)
+func (s *Syncer) syncUbuntuPocket(mirrorURL, pocket string, components, architectures []string) error {
+	cfg := s.config.Get()
+
+	// Sync metadata for this pocket
+	if err := s.syncUbuntuPocketMetadata(mirrorURL, pocket); err != nil {
+		s.logger.LogError("Failed to sync Ubuntu metadata for pocket %s: %v", pocket, err)
+	}
+
+	// Sync each component/architecture
+	for _, component := range components {
+		for _, arch := range architectures {
+			if err := s.syncUbuntuPocketComponent(mirrorURL, pocket, component, arch); err != nil {
+				s.logger.LogError("Failed to sync Ubuntu %s/%s/%s: %v", pocket, component, arch, err)
+				continue
+			}
+
+			// Download packages if enabled
+			if cfg.SyncPackages {
+				if err := s.syncUbuntuPocketPackages(mirrorURL, pocket, component, arch); err != nil {
+					s.logger.LogError("Failed to sync Ubuntu packages for %s/%s/%s: %v", pocket, component, arch, err)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// syncUbuntuPocketMetadata downloads Release, Release.gpg, InRelease files for an Ubuntu pocket
+func (s *Syncer) syncUbuntuPocketMetadata(mirrorURL, pocket string) error {
+	cfg := s.config.Get()
+
+	remoteBase := fmt.Sprintf("%s/dists/%s", mirrorURL, pocket)
+	localBase := filepath.Join(cfg.RepositoryPath, "ubuntu", "dists", pocket)
+
+	if err := os.MkdirAll(localBase, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", localBase, err)
+	}
+
+	metadataFiles := []string{"Release", "Release.gpg", "InRelease"}
+	for _, file := range metadataFiles {
+		remoteURL := fmt.Sprintf("%s/%s", remoteBase, file)
+		localPath := filepath.Join(localBase, file)
+
+		if err := s.downloadFileResume(remoteURL, localPath); err != nil {
+			if file != "Release.gpg" {
+				s.logger.LogError("Failed to download Ubuntu pocket %s/%s: %v", pocket, file, err)
+			}
+			continue
+		}
+		s.logger.LogSync("Downloaded Ubuntu pocket metadata: %s/%s", pocket, file)
+	}
+
+	return nil
+}
+
+// syncUbuntuPocketComponent downloads Packages index files for an Ubuntu pocket component
+func (s *Syncer) syncUbuntuPocketComponent(mirrorURL, pocket, component, arch string) error {
+	cfg := s.config.Get()
+
+	remoteBase := fmt.Sprintf("%s/dists/%s/%s", mirrorURL, pocket, component)
+	localBase := filepath.Join(cfg.RepositoryPath, "ubuntu", "dists", pocket, component)
+
+	// Create directory for binary-<arch>
+	binaryDir := filepath.Join(localBase, fmt.Sprintf("binary-%s", arch))
+	if err := os.MkdirAll(binaryDir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	// Download Packages index files
+	targets := []string{
+		fmt.Sprintf("binary-%s/Packages.gz", arch),
+		fmt.Sprintf("binary-%s/Packages.xz", arch),
+		fmt.Sprintf("binary-%s/Release", arch),
+	}
+
+	successCount := 0
+	for _, target := range targets {
+		remoteURL := fmt.Sprintf("%s/%s", remoteBase, target)
+		localPath := filepath.Join(localBase, target)
+
+		if err := s.downloadFileResume(remoteURL, localPath); err != nil {
+			continue
+		}
+		s.logger.LogSync("Downloaded Ubuntu pocket: %s/%s/%s", pocket, component, target)
+		successCount++
+	}
+
+	if successCount == 0 {
+		return fmt.Errorf("failed to download any index files for Ubuntu pocket %s/%s/%s", pocket, component, arch)
+	}
+
+	return nil
+}
+
+// syncUbuntuPocketPackages downloads .deb packages for an Ubuntu pocket based on its Packages index
+func (s *Syncer) syncUbuntuPocketPackages(mirrorURL, pocket, component, arch string) error {
+	cfg := s.config.Get()
+
+	// Find Packages file
+	packagesPath := ""
+	xzPath := filepath.Join(cfg.RepositoryPath, "ubuntu", "dists", pocket, component, fmt.Sprintf("binary-%s", arch), "Packages.xz")
+	gzPath := filepath.Join(cfg.RepositoryPath, "ubuntu", "dists", pocket, component, fmt.Sprintf("binary-%s", arch), "Packages.gz")
+
+	if stat, err := os.Stat(xzPath); err == nil && stat.Size() > 0 {
+		packagesPath = xzPath
+	} else if stat, err := os.Stat(gzPath); err == nil && stat.Size() > 0 {
+		packagesPath = gzPath
+	}
+
+	if packagesPath == "" {
+		s.logger.LogInfo("No valid Packages file found for Ubuntu pocket %s/%s/%s, skipping", pocket, component, arch)
+		return nil
+	}
+
+	// Parse Packages file
+	packages, err := s.parsePackagesFile(packagesPath)
+	if err != nil {
+		return fmt.Errorf("failed to parse Ubuntu Packages file: %w", err)
+	}
+
+	if len(packages) == 0 {
+		s.logger.LogInfo("No packages found in Ubuntu pocket %s/%s/%s", pocket, component, arch)
+		return nil
+	}
+
+	s.logger.LogInfo("Found %d packages in Ubuntu pocket %s/%s/%s", len(packages), pocket, component, arch)
+
+	// Create download jobs
+	var jobs []DownloadJob
+	for _, pkg := range packages {
+		localPath := filepath.Join(cfg.RepositoryPath, "ubuntu", pkg.Filename)
+
+		// Check if file already exists with correct size
+		if stat, err := os.Stat(localPath); err == nil {
+			if stat.Size() == pkg.Size {
+				continue
+			}
+		}
+
+		jobs = append(jobs, DownloadJob{
+			URL:                fmt.Sprintf("%s/%s", mirrorURL, pkg.Filename),
+			LocalPath:          localPath,
+			ReleaseName:        pocket,
+			RelativePath:       pkg.Filename,
+			PackageName:        pkg.Package,
+			PackageVersion:     pkg.Version,
+			PackageDescription: pkg.Description,
+			PackageSize:        pkg.Size,
+			Component:          component,
+			Architecture:       arch,
+		})
+	}
+
+	if len(jobs) == 0 {
+		s.logger.LogInfo("All Ubuntu packages up to date for pocket %s/%s/%s", pocket, component, arch)
+		return nil
+	}
+
+	s.logger.LogInfo("Downloading %d Ubuntu packages for pocket %s/%s/%s", len(jobs), pocket, component, arch)
+
+	// Download in batches
+	batchSize := 100
+	for i := 0; i < len(jobs); i += batchSize {
+		end := i + batchSize
+		if end > len(jobs) {
+			end = len(jobs)
+		}
+
+		batch := jobs[i:end]
+		results := s.downloadFilesParallel(batch)
+
+		for _, result := range results {
+			if result.Error != nil {
+				s.logger.LogError("Failed to download Ubuntu pocket package %s: %v", result.Job.URL, result.Error)
+				atomic.AddInt64(&s.stats.FailedFiles, 1)
+			} else {
+				atomic.AddInt64(&s.stats.TotalFiles, 1)
+			}
+		}
+
+		// Check disk space
+		exceeded, _, err := utils.CheckDiskSpace(cfg.RepositoryPath, cfg.MaxDiskUsagePercent)
+		if err != nil {
+			s.logger.LogError("Failed to check disk space: %v", err)
+		}
+		if exceeded {
+			s.logger.LogError("Disk space limit reached during Ubuntu pocket package sync, stopping")
+			return fmt.Errorf("disk space exceeded")
+		}
+	}
+
+	return nil
 }

@@ -84,6 +84,8 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
 		.btn { display: inline-flex; align-items: center; gap: 5px; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9em; transition: background 0.2s; }
 		.btn-primary { background: var(--primary); color: #fff; }
 		.btn-primary:hover { background: var(--primary-dark); }
+		.btn-secondary { background: #6c757d; color: #fff; }
+		.btn-secondary:hover { background: #5a6268; }
 		.btn-success { background: var(--success); color: #fff; }
 		.btn-danger { background: var(--danger); color: #fff; }
 		.btn-sm { padding: 6px 12px; font-size: 0.85em; }
@@ -331,9 +333,10 @@ func (wc *WebConsole) renderDashboard(w http.ResponseWriter, r *http.Request, se
 <h1 style="margin:0 0 25px;font-size:1.8em;font-weight:400">Dashboard</h1>
 
 <div class="stats-row">
-	<div class="stat-card primary">
+	<div class="stat-card primary" id="stat-repo-size-card">
 		<p>Repository Size</p>
 		<h2 id="stat-repo-size">-</h2>
+		<div id="stat-repo-size-error" style="display:none;font-size:0.75em;color:#fff;margin-top:5px;padding:5px;background:rgba(0,0,0,0.2);border-radius:4px"></div>
 	</div>
 	<div class="stat-card success">
 		<p>Disk Free</p>
@@ -351,14 +354,28 @@ func (wc *WebConsole) renderDashboard(w http.ResponseWriter, r *http.Request, se
 
 <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:20px">
 	<div class="card">
-		<div class="card-header">Sync Status</div>
+		<div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
+			<span>Sync Status</span>
+			<button id="sync-now-btn" class="btn btn-primary" style="padding:5px 15px;font-size:0.85em" onclick="triggerSync()">Sync Now</button>
+		</div>
 		<div class="card-body">
+			<div id="sync-progress-container" style="display:none;margin-bottom:15px">
+				<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+					<div class="spinner" style="width:20px;height:20px;border:2px solid #e0e0e0;border-top:2px solid #4a90d9;border-radius:50%%;animation:spin 1s linear infinite"></div>
+					<span id="sync-progress-text" style="color:#4a90d9;font-weight:500">Synchronizing...</span>
+				</div>
+				<div style="background:#e0e0e0;border-radius:4px;height:6px;overflow:hidden">
+					<div id="sync-progress-bar" style="background:#4a90d9;height:100%%;width:0;transition:width 0.3s ease"></div>
+				</div>
+			</div>
 			<table class="table">
 				<tr><td><strong>Status</strong></td><td id="sync-running">-</td></tr>
 				<tr><td><strong>Last Sync Start</strong></td><td id="sync-last-start">-</td></tr>
 				<tr><td><strong>Last Sync End</strong></td><td id="sync-last-end">-</td></tr>
 				<tr><td><strong>Duration</strong></td><td id="sync-duration">-</td></tr>
-				<tr><td><strong>Failed Files</strong></td><td id="sync-failed">-</td></tr>
+				<tr><td><strong>Session Downloads</strong></td><td id="sync-session-files">-</td></tr>
+				<tr><td><strong>Session Size</strong></td><td id="sync-session-bytes">-</td></tr>
+				<tr><td><strong>Failed Files</strong></td><td><a href="#" id="sync-failed" onclick="showFailedFiles(); return false;" style="color:#dc3545;text-decoration:none">-</a></td></tr>
 			</table>
 		</div>
 	</div>
@@ -374,9 +391,31 @@ func (wc *WebConsole) renderDashboard(w http.ResponseWriter, r *http.Request, se
 		</div>
 	</div>
 </div>
+
+<!-- Failed Files Modal -->
+<div id="failed-files-modal" style="display:none;position:fixed;top:0;left:0;width:100%%;height:100%%;background:rgba(0,0,0,0.5);z-index:10000;overflow:auto">
+	<div style="background:#fff;margin:50px auto;max-width:900px;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.3)">
+		<div style="display:flex;justify-content:space-between;align-items:center;padding:15px 20px;border-bottom:1px solid #e0e0e0;background:#f8f9fa;border-radius:8px 8px 0 0">
+			<h3 style="margin:0;font-size:1.2em;font-weight:500">Failed Files</h3>
+			<button onclick="closeFailedFilesModal()" style="background:none;border:none;font-size:1.5em;cursor:pointer;color:#666">&times;</button>
+		</div>
+		<div id="failed-files-content" style="padding:20px;max-height:500px;overflow-y:auto">
+			<p style="color:#666">Loading...</p>
+		</div>
+	</div>
+</div>
+
+<style>
+@keyframes spin {
+	0%% { transform: rotate(0deg); }
+	100%% { transform: rotate(360deg); }
+}
+</style>
 <script>
 var syncStats = %s;
 var serverStats = %s;
+var syncWasRunning = false;
+var syncStartTime = null;
 
 function formatBytes(bytes) {
 	if (bytes === 0) return '0 B';
@@ -397,16 +436,172 @@ function formatDuration(ns) {
 	return hours + 'h ' + minutes + 'm';
 }
 
+function triggerSync() {
+	var btn = document.getElementById('sync-now-btn');
+	btn.disabled = true;
+	btn.textContent = 'Starting...';
+
+	fetch('/sync/trigger', { method: 'POST' })
+		.then(response => response.json())
+		.then(data => {
+			if (data.status === 'running') {
+				showNotification('Sync is already in progress', 'info');
+			} else if (data.status === 'success') {
+				showNotification('Sync started successfully', 'success');
+				syncStartTime = new Date();
+			} else {
+				showNotification('Failed to start sync: ' + (data.message || 'Unknown error'), 'error');
+			}
+			updateDashboard();
+		})
+		.catch(err => {
+			showNotification('Error triggering sync: ' + err, 'error');
+			btn.disabled = false;
+			btn.textContent = 'Sync Now';
+		});
+}
+
+function showNotification(message, type) {
+	var notification = document.createElement('div');
+	notification.style.cssText = 'position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:6px;color:#fff;font-weight:500;z-index:10000;animation:fadeIn 0.3s ease';
+	notification.style.background = type === 'success' ? '#28a745' : type === 'error' ? '#dc3545' : '#17a2b8';
+	notification.textContent = message;
+	document.body.appendChild(notification);
+	setTimeout(function() {
+		notification.style.opacity = '0';
+		notification.style.transition = 'opacity 0.3s ease';
+		setTimeout(function() { notification.remove(); }, 300);
+	}, 3000);
+}
+
+function updateSyncProgress(isRunning) {
+	var btn = document.getElementById('sync-now-btn');
+	var progressContainer = document.getElementById('sync-progress-container');
+	var progressBar = document.getElementById('sync-progress-bar');
+	var progressText = document.getElementById('sync-progress-text');
+
+	if (isRunning) {
+		btn.disabled = true;
+		btn.textContent = 'Syncing...';
+		progressContainer.style.display = 'block';
+
+		// Fetch current activity from API
+		fetch('/api/console/sync/activity')
+			.then(response => response.json())
+			.then(data => {
+				if (data.active && data.activity) {
+					var act = data.activity;
+					var displayText = '';
+
+					// Build activity display text
+					if (act.action === 'downloading') {
+						displayText = 'Downloading: ' + act.file;
+						if (act.suite) {
+							displayText += ' (' + act.suite;
+							if (act.component) displayText += '/' + act.component;
+							displayText += ')';
+						}
+					} else if (act.action === 'syncing') {
+						displayText = act.file || 'Synchronizing...';
+					} else if (act.action) {
+						displayText = act.action.charAt(0).toUpperCase() + act.action.slice(1);
+						if (act.file) displayText += ': ' + act.file;
+					} else {
+						displayText = 'Synchronizing...';
+					}
+
+					// Show progress bar based on files count if available
+					if (act.files_count > 0 && act.files_done >= 0) {
+						var pct = Math.min(99, Math.round((act.files_done * 100) / act.files_count));
+						progressBar.style.width = pct + '%%';
+						displayText += ' [' + act.files_done + '/' + act.files_count + ']';
+					} else if (syncStartTime) {
+						var elapsed = (new Date() - syncStartTime) / 1000;
+						var estimatedProgress = Math.min(95, Math.log10(elapsed + 1) * 30);
+						progressBar.style.width = estimatedProgress + '%%';
+					} else {
+						progressBar.style.width = '10%%';
+					}
+
+					progressText.textContent = displayText;
+
+					// Update session download stats
+					document.getElementById('sync-session-files').textContent = (act.session_files || 0).toLocaleString();
+					document.getElementById('sync-session-bytes').textContent = formatBytes(act.session_bytes || 0);
+				} else {
+					// Fallback if no activity info
+					if (syncStartTime) {
+						var elapsed = (new Date() - syncStartTime) / 1000;
+						progressBar.style.width = Math.min(95, Math.log10(elapsed + 1) * 30) + '%%';
+						progressText.textContent = 'Synchronizing... (' + Math.round(elapsed) + 's elapsed)';
+					} else {
+						progressBar.style.width = '10%%';
+						progressText.textContent = 'Synchronizing...';
+					}
+					// Reset session stats when no activity
+					document.getElementById('sync-session-files').textContent = '-';
+					document.getElementById('sync-session-bytes').textContent = '-';
+				}
+			})
+			.catch(function() {
+				// On error, show default
+				progressBar.style.width = '10%%';
+				progressText.textContent = 'Synchronizing...';
+			});
+	} else {
+		btn.disabled = false;
+		btn.textContent = 'Sync Now';
+
+		// Reset session stats when not running
+		document.getElementById('sync-session-files').textContent = '-';
+		document.getElementById('sync-session-bytes').textContent = '-';
+
+		// If sync just finished, show completion
+		if (syncWasRunning) {
+			progressBar.style.width = '100%%';
+			progressText.textContent = 'Sync completed!';
+			progressText.style.color = '#28a745';
+			setTimeout(function() {
+				progressContainer.style.display = 'none';
+				progressBar.style.width = '0';
+				progressText.style.color = '#4a90d9';
+				syncStartTime = null;
+			}, 2000);
+		} else {
+			progressContainer.style.display = 'none';
+		}
+	}
+	syncWasRunning = isRunning;
+}
+
 function updateDashboard() {
 	fetch('/api/console/stats')
 		.then(response => response.json())
 		.then(data => {
 			if (data.sync) {
-				document.getElementById('sync-running').textContent = data.sync.is_running ? 'Running' : 'Idle';
+				var isRunning = data.sync.is_running;
+				document.getElementById('sync-running').innerHTML = isRunning ?
+					'<span style="color:#28a745;font-weight:500">Running</span>' :
+					'<span style="color:#666">Idle</span>';
 				document.getElementById('sync-last-start').textContent = data.sync.last_sync_start ? new Date(data.sync.last_sync_start).toLocaleString() : '-';
 				document.getElementById('sync-last-end').textContent = data.sync.last_sync_end && !data.sync.last_sync_end.startsWith('0001') ? new Date(data.sync.last_sync_end).toLocaleString() : '-';
 				document.getElementById('sync-duration').textContent = data.sync.last_sync_duration ? formatDuration(data.sync.last_sync_duration) : '-';
-				document.getElementById('sync-failed').textContent = data.sync.failed_files || 0;
+				var failedCount = data.sync.failed_files || 0;
+				var failedEl = document.getElementById('sync-failed');
+				failedEl.textContent = failedCount;
+				if (failedCount > 0) {
+					failedEl.style.color = '#dc3545';
+					failedEl.style.fontWeight = '600';
+					failedEl.style.cursor = 'pointer';
+					failedEl.style.textDecoration = 'underline';
+				} else {
+					failedEl.style.color = '#28a745';
+					failedEl.style.fontWeight = 'normal';
+					failedEl.style.cursor = 'default';
+					failedEl.style.textDecoration = 'none';
+				}
+
+				updateSyncProgress(isRunning);
 			}
 			if (data.server) {
 				document.getElementById('stat-requests').textContent = data.server.total_requests || 0;
@@ -419,11 +614,107 @@ function updateDashboard() {
 				document.getElementById('stat-repo-size').textContent = formatBytes(data.disk.repository_size || 0);
 				document.getElementById('stat-disk-free').textContent = formatBytes(data.disk.free_bytes || 0);
 			}
+			// Handle disk error display on Repository Size widget
+			var repoSizeCard = document.getElementById('stat-repo-size-card');
+			var repoSizeError = document.getElementById('stat-repo-size-error');
+			if (data.sync && data.sync.disk_error) {
+				repoSizeCard.className = 'stat-card';
+				repoSizeCard.style.borderLeftColor = 'var(--danger)';
+				repoSizeCard.style.background = '#ffebee';
+				repoSizeError.style.display = 'block';
+				repoSizeError.style.color = '#c62828';
+				repoSizeError.style.background = 'rgba(198,40,40,0.1)';
+				repoSizeError.textContent = data.sync.disk_error_message || 'Disk usage full';
+			} else {
+				repoSizeCard.className = 'stat-card primary';
+				repoSizeCard.style.borderLeftColor = '';
+				repoSizeCard.style.background = '';
+				repoSizeError.style.display = 'none';
+				repoSizeError.textContent = '';
+			}
 		});
 }
 
+function showFailedFiles() {
+	var failedCount = parseInt(document.getElementById('sync-failed').textContent) || 0;
+	if (failedCount === 0) {
+		showNotification('No failed files to display', 'info');
+		return;
+	}
+
+	document.getElementById('failed-files-modal').style.display = 'block';
+	document.getElementById('failed-files-content').innerHTML = '<p style="color:#666">Loading...</p>';
+
+	fetch('/api/console/sync/failed-files')
+		.then(response => response.json())
+		.then(data => {
+			var content = document.getElementById('failed-files-content');
+			if (!data.failed_files || data.failed_files.length === 0) {
+				// Show helpful message when list is empty but count exists
+				var msg = '<div style="text-align:center;padding:20px">';
+				msg += '<p style="color:#666;font-size:1.1em">No detailed failure information available.</p>';
+				msg += '<p style="color:#888;font-size:0.9em;margin-top:10px">';
+				msg += 'The failed files count (' + failedCount + ') is from a previous sync session.<br>';
+				msg += 'Detailed error information is only available during and after the current sync.</p>';
+				msg += '<p style="color:#888;font-size:0.9em;margin-top:15px">';
+				msg += 'Run a new sync to see detailed failure information.</p>';
+				msg += '</div>';
+				content.innerHTML = msg;
+				return;
+			}
+
+			var html = '<table style="width:100%%;border-collapse:collapse">';
+			html += '<thead><tr style="background:#f8f9fa;border-bottom:2px solid #e0e0e0">';
+			html += '<th style="padding:10px;text-align:left">File/URL</th>';
+			html += '<th style="padding:10px;text-align:left;width:150px">Suite/Component</th>';
+			html += '<th style="padding:10px;text-align:left">Error</th>';
+			html += '<th style="padding:10px;text-align:left;width:150px">Time</th>';
+			html += '</tr></thead><tbody>';
+
+			data.failed_files.forEach(function(file, idx) {
+				var bgColor = idx %% 2 === 0 ? '#fff' : '#f8f9fa';
+				var displayPath = file.url || file.local_path || '-';
+				if (displayPath.length > 60) {
+					displayPath = '...' + displayPath.slice(-57);
+				}
+				var suite = file.suite || '-';
+				var component = file.component ? '/' + file.component : '';
+				var errorMsg = file.error || '-';
+				if (errorMsg.length > 80) {
+					errorMsg = errorMsg.slice(0, 77) + '...';
+				}
+				var timestamp = file.timestamp ? new Date(file.timestamp).toLocaleString() : '-';
+
+				html += '<tr style="background:' + bgColor + ';border-bottom:1px solid #e0e0e0">';
+				html += '<td style="padding:8px;font-family:monospace;font-size:0.85em;word-break:break-all" title="' + (file.url || file.local_path || '') + '">' + displayPath + '</td>';
+				html += '<td style="padding:8px">' + suite + component + '</td>';
+				html += '<td style="padding:8px;color:#dc3545;font-size:0.9em" title="' + (file.error || '') + '">' + errorMsg + '</td>';
+				html += '<td style="padding:8px;font-size:0.85em;color:#666">' + timestamp + '</td>';
+				html += '</tr>';
+			});
+
+			html += '</tbody></table>';
+			html += '<p style="margin-top:15px;color:#666;font-size:0.9em">Total: ' + data.count + ' failed file(s)</p>';
+			content.innerHTML = html;
+		})
+		.catch(function(err) {
+			document.getElementById('failed-files-content').innerHTML = '<p style="color:#dc3545">Error loading failed files: ' + err + '</p>';
+		});
+}
+
+function closeFailedFilesModal() {
+	document.getElementById('failed-files-modal').style.display = 'none';
+}
+
+// Close modal when clicking outside
+document.getElementById('failed-files-modal').addEventListener('click', function(e) {
+	if (e.target === this) {
+		closeFailedFilesModal();
+	}
+});
+
 updateDashboard();
-setInterval(updateDashboard, 10000);
+setInterval(updateDashboard, 3000); // Update more frequently to show sync progress
 </script>
 `, string(syncJSON), string(serverJSON))
 
@@ -456,6 +747,40 @@ func (wc *WebConsole) renderSettings(w http.ResponseWriter, r *http.Request, ses
 					<label>Max Concurrent Downloads</label>
 					<input type="number" class="form-control" id="max_concurrent_downloads" min="1" max="32">
 				</div>
+
+				<h4 style="margin:20px 0 15px;padding-top:15px;border-top:1px solid #eee">Sync Time Restriction</h4>
+				<div class="form-group">
+					<label style="display:flex;align-items:center;gap:8px">
+						<input type="checkbox" id="sync_allowed_hours_enabled"> Enable sync time restriction
+					</label>
+					<small style="display:block;color:#666;margin-top:4px">When enabled, synchronization will only run during the specified time window</small>
+				</div>
+				<div id="sync-hours-fields" style="display:none;margin-left:24px">
+					<div style="display:grid;grid-template-columns:1fr 1fr;gap:15px">
+						<div class="form-group">
+							<label>Start Time</label>
+							<input type="time" class="form-control" id="sync_allowed_hours_start" value="02:00">
+						</div>
+						<div class="form-group">
+							<label>End Time</label>
+							<input type="time" class="form-control" id="sync_allowed_hours_end" value="06:00">
+						</div>
+					</div>
+					<small style="display:block;color:#666;margin-top:4px">Sync will only run between these hours (24-hour format)</small>
+				</div>
+
+				<h4 style="margin:20px 0 15px;padding-top:15px;border-top:1px solid #eee">Debian Releases</h4>
+				<div class="form-group">
+					<label>Releases to Mirror</label>
+					<div id="releases-container" style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:10px"></div>
+					<div style="display:flex;gap:10px;align-items:center">
+						<input type="text" class="form-control" id="new_release" placeholder="e.g., bookworm, trixie, buster" style="flex:1">
+						<button type="button" class="btn btn-secondary" onclick="addRelease()">Add Release</button>
+					</div>
+					<small style="display:block;color:#666;margin-top:8px">
+						<strong>Note:</strong> Archived releases (buster and older) will automatically use archive.debian.org
+					</small>
+				</div>
 `
 
 	if isAdmin {
@@ -474,13 +799,104 @@ func (wc *WebConsole) renderSettings(w http.ResponseWriter, r *http.Request, ses
 			<div class="card-body">
 				<table class="table">
 					<tr><td>Repository Path</td><td id="cfg-repo-path">-</td></tr>
-					<tr><td>Debian Mirror</td><td id="cfg-mirror">-</td></tr>
+					<tr><td colspan="2" style="background:#f5f5f5;font-weight:600">Debian</td></tr>
+					<tr><td>Mirror</td><td id="cfg-mirror">-</td></tr>
 					<tr><td>Releases</td><td id="cfg-releases">-</td></tr>
 					<tr><td>Architectures</td><td id="cfg-archs">-</td></tr>
+					<tr><td colspan="2" style="background:#f5f5f5;font-weight:600">Ubuntu</td></tr>
+					<tr><td>Enabled</td><td id="cfg-ubuntu-enabled">-</td></tr>
+					<tr><td>Mirror</td><td id="cfg-ubuntu-mirror">-</td></tr>
+					<tr><td>Releases</td><td id="cfg-ubuntu-releases">-</td></tr>
+					<tr><td colspan="2" style="background:#f5f5f5;font-weight:600">Ports</td></tr>
 					<tr><td>HTTP Port</td><td id="cfg-http-port">-</td></tr>
 					<tr><td>HTTPS Port</td><td id="cfg-https-port">-</td></tr>
 					<tr><td>API Port</td><td id="cfg-api-port">-</td></tr>
 				</table>
+			</div>
+		</div>
+		<div class="card" style="margin-bottom:20px">
+			<div class="card-header">Ubuntu Repository</div>
+			<div class="card-body">
+				<form id="ubuntu-form">
+					<div class="form-group">
+						<label style="display:flex;align-items:center;gap:8px">
+							<input type="checkbox" id="sync_ubuntu_repository"> Enable Ubuntu Repository Sync
+						</label>
+						<small style="display:block;color:#666;margin-top:4px">When enabled, the daemon will mirror Ubuntu packages alongside Debian packages. Ubuntu packages are stored in the <code>ubuntu/</code> subdirectory.</small>
+					</div>
+					<div id="ubuntu-options" style="display:none;margin-top:15px;padding-top:15px;border-top:1px solid #eee">
+						<div class="form-group">
+							<label>Ubuntu Mirror</label>
+							<input type="text" class="form-control" id="ubuntu_mirror" placeholder="http://archive.ubuntu.com/ubuntu">
+							<small style="display:block;color:#666;margin-top:4px">Default: http://archive.ubuntu.com/ubuntu</small>
+						</div>
+						<div class="form-group">
+							<label>Ubuntu Releases</label>
+							<div id="ubuntu-releases-container" style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:10px"></div>
+							<div style="display:flex;gap:10px;align-items:center">
+								<input type="text" class="form-control" id="new_ubuntu_release" placeholder="e.g., jammy, noble, focal" style="flex:1">
+								<button type="button" class="btn btn-secondary" onclick="addUbuntuRelease()">Add</button>
+							</div>
+							<small style="display:block;color:#666;margin-top:8px">
+								<strong>LTS releases:</strong> focal (20.04), jammy (22.04), noble (24.04)<br>
+								<strong>Note:</strong> Archived releases automatically use old-releases.ubuntu.com
+							</small>
+						</div>
+						<div class="form-group">
+							<label>Architectures</label>
+							<div style="display:flex;gap:15px;flex-wrap:wrap">
+								<label style="display:flex;align-items:center;gap:5px;font-weight:normal">
+									<input type="checkbox" id="ubuntu_arch_amd64" checked> amd64
+								</label>
+								<label style="display:flex;align-items:center;gap:5px;font-weight:normal">
+									<input type="checkbox" id="ubuntu_arch_arm64"> arm64
+								</label>
+								<label style="display:flex;align-items:center;gap:5px;font-weight:normal">
+									<input type="checkbox" id="ubuntu_arch_i386"> i386
+								</label>
+							</div>
+						</div>
+						<div class="form-group">
+							<label>Components</label>
+							<div style="display:flex;gap:15px;flex-wrap:wrap">
+								<label style="display:flex;align-items:center;gap:5px;font-weight:normal">
+									<input type="checkbox" id="ubuntu_comp_main" checked> main
+								</label>
+								<label style="display:flex;align-items:center;gap:5px;font-weight:normal">
+									<input type="checkbox" id="ubuntu_comp_restricted" checked> restricted
+								</label>
+								<label style="display:flex;align-items:center;gap:5px;font-weight:normal">
+									<input type="checkbox" id="ubuntu_comp_universe" checked> universe
+								</label>
+								<label style="display:flex;align-items:center;gap:5px;font-weight:normal">
+									<input type="checkbox" id="ubuntu_comp_multiverse" checked> multiverse
+								</label>
+							</div>
+						</div>
+						<div class="form-group">
+							<label>Pockets (Update Channels)</label>
+							<div style="display:flex;gap:15px;flex-wrap:wrap">
+								<label style="display:flex;align-items:center;gap:5px;font-weight:normal">
+									<input type="checkbox" id="ubuntu_sync_updates" checked> -updates
+								</label>
+								<label style="display:flex;align-items:center;gap:5px;font-weight:normal">
+									<input type="checkbox" id="ubuntu_sync_security" checked> -security
+								</label>
+								<label style="display:flex;align-items:center;gap:5px;font-weight:normal">
+									<input type="checkbox" id="ubuntu_sync_backports"> -backports
+								</label>
+								<label style="display:flex;align-items:center;gap:5px;font-weight:normal">
+									<input type="checkbox" id="ubuntu_sync_proposed"> -proposed
+								</label>
+							</div>
+							<small style="display:block;color:#666;margin-top:4px">-proposed contains pre-release updates (testing)</small>
+						</div>
+					</div>
+					<div id="ubuntu-status" style="padding:10px;background:#f5f5f5;border-radius:4px;margin:15px 0">
+						<strong>Status:</strong> <span id="ubuntu-status-text">-</span>
+					</div>
+					<button type="submit" class="btn btn-primary">Save Ubuntu Settings</button>
+				</form>
 			</div>
 		</div>
 		<div class="card" style="margin-bottom:20px">
@@ -539,6 +955,9 @@ func (wc *WebConsole) renderSettings(w http.ResponseWriter, r *http.Request, ses
 	</div>
 </div>
 <script>
+var currentReleases = [];
+var currentUbuntuReleases = [];
+
 function loadConfig() {
 	fetch('/api/console/config')
 		.then(response => response.json())
@@ -553,6 +972,42 @@ function loadConfig() {
 			document.getElementById('cfg-http-port').textContent = data.http_port || '-';
 			document.getElementById('cfg-https-port').textContent = data.https_port || '-';
 			document.getElementById('cfg-api-port').textContent = data.api_port || '-';
+
+			// Ubuntu current settings display
+			document.getElementById('cfg-ubuntu-enabled').innerHTML = data.sync_ubuntu_repository ?
+				'<span style="color:#4caf50">Yes</span>' : '<span style="color:#9e9e9e">No</span>';
+			document.getElementById('cfg-ubuntu-mirror').textContent = data.ubuntu_mirror || 'http://archive.ubuntu.com/ubuntu';
+			document.getElementById('cfg-ubuntu-releases').textContent = (data.ubuntu_releases || []).join(', ') || '-';
+
+			// Sync time restriction
+			document.getElementById('sync_allowed_hours_enabled').checked = data.sync_allowed_hours_enabled || false;
+			document.getElementById('sync_allowed_hours_start').value = data.sync_allowed_hours_start || '02:00';
+			document.getElementById('sync_allowed_hours_end').value = data.sync_allowed_hours_end || '06:00';
+			updateSyncHoursUI();
+
+			// Debian releases
+			currentReleases = data.debian_releases || [];
+			renderReleases();
+
+			// Ubuntu repository settings
+			document.getElementById('sync_ubuntu_repository').checked = data.sync_ubuntu_repository || false;
+			document.getElementById('ubuntu_mirror').value = data.ubuntu_mirror || 'http://archive.ubuntu.com/ubuntu';
+			currentUbuntuReleases = data.ubuntu_releases || [];
+			renderUbuntuReleases();
+			updateUbuntuUI();
+
+			// Ubuntu architectures
+			var ubuntuArchs = data.ubuntu_architectures || ['amd64'];
+			document.getElementById('ubuntu_arch_amd64').checked = ubuntuArchs.indexOf('amd64') !== -1;
+			document.getElementById('ubuntu_arch_arm64').checked = ubuntuArchs.indexOf('arm64') !== -1;
+			document.getElementById('ubuntu_arch_i386').checked = ubuntuArchs.indexOf('i386') !== -1;
+
+			// Ubuntu components
+			var ubuntuComps = data.ubuntu_components || ['main', 'restricted', 'universe', 'multiverse'];
+			document.getElementById('ubuntu_comp_main').checked = ubuntuComps.indexOf('main') !== -1;
+			document.getElementById('ubuntu_comp_restricted').checked = ubuntuComps.indexOf('restricted') !== -1;
+			document.getElementById('ubuntu_comp_universe').checked = ubuntuComps.indexOf('universe') !== -1;
+			document.getElementById('ubuntu_comp_multiverse').checked = ubuntuComps.indexOf('multiverse') !== -1;
 
 			// Artica repository settings
 			document.getElementById('sync_artica_repository').checked = data.sync_artica_repository || false;
@@ -570,6 +1025,52 @@ function loadConfig() {
 		});
 }
 
+function updateSyncHoursUI() {
+	var enabled = document.getElementById('sync_allowed_hours_enabled').checked;
+	document.getElementById('sync-hours-fields').style.display = enabled ? 'block' : 'none';
+}
+
+function renderReleases() {
+	var container = document.getElementById('releases-container');
+	container.innerHTML = '';
+	var archivedReleases = ['buzz', 'rex', 'bo', 'hamm', 'slink', 'potato', 'woody', 'sarge', 'etch', 'lenny', 'squeeze', 'wheezy', 'jessie', 'stretch', 'buster'];
+	currentReleases.forEach(function(release) {
+		var isArchived = archivedReleases.indexOf(release) !== -1;
+		var badge = document.createElement('span');
+		badge.style.cssText = 'display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;font-size:13px;' +
+			(isArchived ? 'background:#fff3e0;color:#e65100;border:1px solid #ffcc80' : 'background:#e3f2fd;color:#1565c0;border:1px solid #90caf9');
+		badge.innerHTML = release + (isArchived ? ' <small style="opacity:0.7">(archive)</small>' : '') +
+			' <button type="button" onclick="removeRelease(\'' + release + '\')" style="background:none;border:none;cursor:pointer;padding:0;margin-left:4px;font-size:16px;line-height:1;opacity:0.7">&times;</button>';
+		container.appendChild(badge);
+	});
+	if (currentReleases.length === 0) {
+		container.innerHTML = '<span style="color:#999;font-style:italic">No releases configured</span>';
+	}
+}
+
+function addRelease() {
+	var input = document.getElementById('new_release');
+	var release = input.value.trim().toLowerCase();
+	if (release && currentReleases.indexOf(release) === -1) {
+		currentReleases.push(release);
+		renderReleases();
+		input.value = '';
+	}
+}
+
+function removeRelease(release) {
+	currentReleases = currentReleases.filter(function(r) { return r !== release; });
+	renderReleases();
+}
+
+document.getElementById('sync_allowed_hours_enabled').addEventListener('change', updateSyncHoursUI);
+document.getElementById('new_release').addEventListener('keypress', function(e) {
+	if (e.key === 'Enter') {
+		e.preventDefault();
+		addRelease();
+	}
+});
+
 function updateArticaStatus(enabled) {
 	var statusText = document.getElementById('artica-status-text');
 	if (enabled) {
@@ -578,6 +1079,105 @@ function updateArticaStatus(enabled) {
 		statusText.innerHTML = '<span style="color:#9e9e9e">Disabled</span> - Artica packages will not be synced';
 	}
 }
+
+// Ubuntu functions
+function updateUbuntuUI() {
+	var enabled = document.getElementById('sync_ubuntu_repository').checked;
+	document.getElementById('ubuntu-options').style.display = enabled ? 'block' : 'none';
+	updateUbuntuStatus(enabled);
+}
+
+function updateUbuntuStatus(enabled) {
+	var statusText = document.getElementById('ubuntu-status-text');
+	if (enabled) {
+		var releases = currentUbuntuReleases.length > 0 ? currentUbuntuReleases.join(', ') : 'none configured';
+		statusText.innerHTML = '<span style="color:#4caf50">Enabled</span> - Releases: ' + releases;
+	} else {
+		statusText.innerHTML = '<span style="color:#9e9e9e">Disabled</span> - Ubuntu packages will not be synced';
+	}
+}
+
+function renderUbuntuReleases() {
+	var container = document.getElementById('ubuntu-releases-container');
+	container.innerHTML = '';
+	var ltsReleases = ['focal', 'jammy', 'noble', 'bionic', 'xenial', 'trusty'];
+	currentUbuntuReleases.forEach(function(release) {
+		var isLTS = ltsReleases.indexOf(release) !== -1;
+		var badge = document.createElement('span');
+		badge.style.cssText = 'display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;font-size:13px;' +
+			(isLTS ? 'background:#e8f5e9;color:#2e7d32;border:1px solid #a5d6a7' : 'background:#fff3e0;color:#e65100;border:1px solid #ffcc80');
+		badge.innerHTML = release + (isLTS ? ' <small style="opacity:0.7">(LTS)</small>' : '') +
+			' <button type="button" onclick="removeUbuntuRelease(\'' + release + '\')" style="background:none;border:none;cursor:pointer;padding:0;margin-left:4px;font-size:16px;line-height:1;opacity:0.7">&times;</button>';
+		container.appendChild(badge);
+	});
+	if (currentUbuntuReleases.length === 0) {
+		container.innerHTML = '<span style="color:#999;font-style:italic">No releases configured</span>';
+	}
+	updateUbuntuStatus(document.getElementById('sync_ubuntu_repository').checked);
+}
+
+function addUbuntuRelease() {
+	var input = document.getElementById('new_ubuntu_release');
+	var release = input.value.trim().toLowerCase();
+	if (release && currentUbuntuReleases.indexOf(release) === -1) {
+		currentUbuntuReleases.push(release);
+		renderUbuntuReleases();
+		input.value = '';
+	}
+}
+
+function removeUbuntuRelease(release) {
+	currentUbuntuReleases = currentUbuntuReleases.filter(function(r) { return r !== release; });
+	renderUbuntuReleases();
+}
+
+document.getElementById('sync_ubuntu_repository').addEventListener('change', updateUbuntuUI);
+document.getElementById('new_ubuntu_release').addEventListener('keypress', function(e) {
+	if (e.key === 'Enter') {
+		e.preventDefault();
+		addUbuntuRelease();
+	}
+});
+
+document.getElementById('ubuntu-form').addEventListener('submit', function(e) {
+	e.preventDefault();
+
+	// Collect Ubuntu architectures
+	var ubuntuArchs = [];
+	if (document.getElementById('ubuntu_arch_amd64').checked) ubuntuArchs.push('amd64');
+	if (document.getElementById('ubuntu_arch_arm64').checked) ubuntuArchs.push('arm64');
+	if (document.getElementById('ubuntu_arch_i386').checked) ubuntuArchs.push('i386');
+
+	// Collect Ubuntu components
+	var ubuntuComps = [];
+	if (document.getElementById('ubuntu_comp_main').checked) ubuntuComps.push('main');
+	if (document.getElementById('ubuntu_comp_restricted').checked) ubuntuComps.push('restricted');
+	if (document.getElementById('ubuntu_comp_universe').checked) ubuntuComps.push('universe');
+	if (document.getElementById('ubuntu_comp_multiverse').checked) ubuntuComps.push('multiverse');
+
+	var data = {
+		sync_ubuntu_repository: document.getElementById('sync_ubuntu_repository').checked,
+		ubuntu_mirror: document.getElementById('ubuntu_mirror').value || 'http://archive.ubuntu.com/ubuntu',
+		ubuntu_releases: currentUbuntuReleases,
+		ubuntu_architectures: ubuntuArchs,
+		ubuntu_components: ubuntuComps
+	};
+
+	fetch('/api/console/config/update', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(data)
+	})
+	.then(response => response.json())
+	.then(result => {
+		if (result.status === 'success') {
+			alert('Ubuntu repository settings saved successfully. Changes will take effect on next sync.');
+			loadConfig();
+		} else {
+			alert('Failed to save Ubuntu settings: ' + (result.message || 'Unknown error'));
+		}
+	});
+});
 
 function updateSSLUI() {
 	var useServerCert = document.getElementById('web_console_tls_use_server_cert').checked;
@@ -616,7 +1216,11 @@ document.getElementById('config-form').addEventListener('submit', function(e) {
 	var data = {
 		sync_interval: parseInt(document.getElementById('sync_interval').value),
 		max_disk_usage_percent: parseInt(document.getElementById('max_disk_usage_percent').value),
-		max_concurrent_downloads: parseInt(document.getElementById('max_concurrent_downloads').value)
+		max_concurrent_downloads: parseInt(document.getElementById('max_concurrent_downloads').value),
+		sync_allowed_hours_enabled: document.getElementById('sync_allowed_hours_enabled').checked,
+		sync_allowed_hours_start: document.getElementById('sync_allowed_hours_start').value,
+		sync_allowed_hours_end: document.getElementById('sync_allowed_hours_end').value,
+		debian_releases: currentReleases
 	};
 	fetch('/api/console/config/update', {
 		method: 'POST',
@@ -629,7 +1233,7 @@ document.getElementById('config-form').addEventListener('submit', function(e) {
 			alert('Configuration saved successfully');
 			loadConfig();
 		} else {
-			alert('Failed to save configuration');
+			alert('Failed to save configuration: ' + (result.message || 'Unknown error'));
 		}
 	});
 });
@@ -767,9 +1371,106 @@ func (wc *WebConsole) renderEvents(w http.ResponseWriter, r *http.Request, sessi
 	content := `
 <h1 style="margin:0 0 25px;font-size:1.8em;font-weight:400">Events</h1>
 
-<div class="card">
-	<div class="card-header">Recent Package Updates</div>
+<!-- Sync Events Summary -->
+<div class="stats-row" style="margin-bottom:20px">
+	<div class="stat-card primary" id="stat-total-syncs">
+		<p>Total Syncs</p>
+		<h2 id="total-syncs-count">-</h2>
+	</div>
+	<div class="stat-card success" id="stat-total-files">
+		<p>Files Downloaded</p>
+		<h2 id="total-files-count">-</h2>
+	</div>
+	<div class="stat-card info" id="stat-total-size">
+		<p>Data Downloaded</p>
+		<h2 id="total-size-count">-</h2>
+	</div>
+	<div class="stat-card warning" id="stat-repos">
+		<p>Repositories</p>
+		<h2 id="repos-count">-</h2>
+	</div>
+</div>
+
+<!-- Tabs -->
+<div style="margin-bottom:20px">
+	<button class="btn btn-primary" id="tab-sync-events" onclick="showTab('sync-events')" style="margin-right:5px">Sync Events</button>
+	<button class="btn btn-secondary" id="tab-repo-stats" onclick="showTab('repo-stats')" style="margin-right:5px">Repository Stats</button>
+	<button class="btn btn-secondary" id="tab-daily" onclick="showTab('daily')" style="margin-right:5px">Daily Summary</button>
+	<button class="btn btn-secondary" id="tab-package-updates" onclick="showTab('package-updates')">Package Updates</button>
+</div>
+
+<!-- Sync Events Tab -->
+<div id="panel-sync-events" class="card">
+	<div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
+		<span>Recent Sync Events</span>
+		<select id="events-filter" class="form-control" style="width:200px" onchange="loadSyncEvents()">
+			<option value="">All Repositories</option>
+		</select>
+	</div>
+	<div class="card-body" style="padding:0;max-height:500px;overflow-y:auto">
+		<table class="table table-striped" id="sync-events-table">
+			<thead>
+				<tr>
+					<th>Date</th>
+					<th>Repository</th>
+					<th>Files</th>
+					<th>Size</th>
+					<th>Duration</th>
+					<th>Failed</th>
+				</tr>
+			</thead>
+			<tbody id="sync-events-body">
+			</tbody>
+		</table>
+	</div>
+</div>
+
+<!-- Repository Stats Tab -->
+<div id="panel-repo-stats" class="card" style="display:none">
+	<div class="card-header">Repository Statistics</div>
 	<div class="card-body" style="padding:0">
+		<table class="table table-striped" id="repo-stats-table">
+			<thead>
+				<tr>
+					<th>Repository</th>
+					<th>Total Syncs</th>
+					<th>Total Files</th>
+					<th>Total Size</th>
+					<th>Avg Duration</th>
+					<th>Total Failed</th>
+					<th>Last Sync</th>
+				</tr>
+			</thead>
+			<tbody id="repo-stats-body">
+			</tbody>
+		</table>
+	</div>
+</div>
+
+<!-- Daily Summary Tab -->
+<div id="panel-daily" class="card" style="display:none">
+	<div class="card-header">Daily Sync Summary (Last 15 Days)</div>
+	<div class="card-body" style="padding:0">
+		<table class="table table-striped" id="daily-table">
+			<thead>
+				<tr>
+					<th>Date</th>
+					<th>Syncs</th>
+					<th>Files Downloaded</th>
+					<th>Data Downloaded</th>
+					<th>Failed</th>
+				</tr>
+			</thead>
+			<tbody id="daily-body">
+			</tbody>
+		</table>
+	</div>
+</div>
+
+<!-- Package Updates Tab -->
+<div id="panel-package-updates" class="card" style="display:none">
+	<div class="card-header">Recent Package Updates</div>
+	<div class="card-body" style="padding:0;max-height:500px;overflow-y:auto">
 		<table class="table table-striped" id="updates-table">
 			<thead>
 				<tr>
@@ -786,37 +1487,200 @@ func (wc *WebConsole) renderEvents(w http.ResponseWriter, r *http.Request, sessi
 		</table>
 	</div>
 </div>
+
 <script>
+var currentTab = 'sync-events';
+var repoList = [];
+
+function formatBytes(bytes) {
+	if (bytes === 0) return '0 B';
+	var k = 1024;
+	var sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+	var i = Math.floor(Math.log(bytes) / Math.log(k));
+	return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function formatDuration(ms) {
+	if (!ms || ms === 0) return '-';
+	var seconds = Math.floor(ms / 1000);
+	if (seconds < 60) return seconds + 's';
+	var minutes = Math.floor(seconds / 60);
+	seconds = seconds %% 60;
+	if (minutes < 60) return minutes + 'm ' + seconds + 's';
+	var hours = Math.floor(minutes / 60);
+	minutes = minutes %% 60;
+	return hours + 'h ' + minutes + 'm';
+}
+
+function showTab(tab) {
+	currentTab = tab;
+	document.querySelectorAll('[id^="panel-"]').forEach(function(p) { p.style.display = 'none'; });
+	document.querySelectorAll('[id^="tab-"]').forEach(function(t) { t.className = 'btn btn-secondary'; });
+	document.getElementById('panel-' + tab).style.display = 'block';
+	document.getElementById('tab-' + tab).className = 'btn btn-primary';
+
+	if (tab === 'sync-events') loadSyncEvents();
+	else if (tab === 'repo-stats') loadRepoStats();
+	else if (tab === 'daily') loadDailySummary();
+	else if (tab === 'package-updates') loadUpdates();
+}
+
+function loadSyncEvents() {
+	var filter = document.getElementById('events-filter').value;
+	var url = '/api/console/events?limit=100';
+	if (filter) url += '&repository=' + encodeURIComponent(filter);
+
+	fetch(url)
+		.then(response => response.json())
+		.then(data => {
+			var tbody = document.getElementById('sync-events-body');
+			tbody.innerHTML = '';
+			if (data.events && data.events.length > 0) {
+				data.events.forEach(function(e) {
+					var row = document.createElement('tr');
+					var failedStyle = e.failed_files > 0 ? 'color:#dc3545;font-weight:600' : 'color:#28a745';
+					row.innerHTML = '<td>' + new Date(e.date).toLocaleString() + '</td>' +
+						'<td><span class="label label-primary">' + escapeHtml(e.repository_name) + '</span></td>' +
+						'<td>' + (e.num_files || 0).toLocaleString() + '</td>' +
+						'<td>' + formatBytes(e.num_size || 0) + '</td>' +
+						'<td>' + formatDuration(e.duration_ms) + '</td>' +
+						'<td style="' + failedStyle + '">' + (e.failed_files || 0) + '</td>';
+					tbody.appendChild(row);
+				});
+			} else {
+				tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#666;padding:30px">No sync events recorded yet</td></tr>';
+			}
+		})
+		.catch(function(err) {
+			document.getElementById('sync-events-body').innerHTML =
+				'<tr><td colspan="6" style="text-align:center;color:#dc3545;padding:30px">Failed to load events: ' + err.message + '</td></tr>';
+		});
+}
+
+function loadRepoStats() {
+	fetch('/api/console/events/stats')
+		.then(response => response.json())
+		.then(data => {
+			var tbody = document.getElementById('repo-stats-body');
+			tbody.innerHTML = '';
+
+			// Update summary cards
+			document.getElementById('total-syncs-count').textContent = data.total_count || 0;
+			document.getElementById('repos-count').textContent = data.stats ? data.stats.length : 0;
+
+			// Calculate totals
+			var totalFiles = 0, totalSize = 0;
+			if (data.stats) {
+				data.stats.forEach(function(s) {
+					totalFiles += s.total_files || 0;
+					totalSize += s.total_size || 0;
+				});
+			}
+			document.getElementById('total-files-count').textContent = totalFiles.toLocaleString();
+			document.getElementById('total-size-count').textContent = formatBytes(totalSize);
+
+			// Update filter dropdown
+			var filter = document.getElementById('events-filter');
+			var currentValue = filter.value;
+			filter.innerHTML = '<option value="">All Repositories</option>';
+			repoList = [];
+			if (data.stats && data.stats.length > 0) {
+				data.stats.forEach(function(s) {
+					repoList.push(s.repository_name);
+					filter.innerHTML += '<option value="' + escapeHtml(s.repository_name) + '">' + escapeHtml(s.repository_name) + '</option>';
+
+					var row = document.createElement('tr');
+					row.innerHTML = '<td><strong>' + escapeHtml(s.repository_name) + '</strong></td>' +
+						'<td>' + (s.total_syncs || 0).toLocaleString() + '</td>' +
+						'<td>' + (s.total_files || 0).toLocaleString() + '</td>' +
+						'<td>' + formatBytes(s.total_size || 0) + '</td>' +
+						'<td>' + formatDuration(s.avg_duration_ms) + '</td>' +
+						'<td style="' + (s.total_failed > 0 ? 'color:#dc3545' : 'color:#28a745') + '">' + (s.total_failed || 0) + '</td>' +
+						'<td>' + new Date(s.last_sync).toLocaleString() + '</td>';
+					tbody.appendChild(row);
+				});
+			}
+			filter.value = currentValue;
+
+			if (!data.stats || data.stats.length === 0) {
+				tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#666;padding:30px">No repository statistics available</td></tr>';
+			}
+		})
+		.catch(function(err) {
+			document.getElementById('repo-stats-body').innerHTML =
+				'<tr><td colspan="7" style="text-align:center;color:#dc3545;padding:30px">Failed to load stats: ' + err.message + '</td></tr>';
+		});
+}
+
+function loadDailySummary() {
+	fetch('/api/console/events/daily?days=15')
+		.then(response => response.json())
+		.then(data => {
+			var tbody = document.getElementById('daily-body');
+			tbody.innerHTML = '';
+			if (data.summary && data.summary.length > 0) {
+				data.summary.forEach(function(d) {
+					var row = document.createElement('tr');
+					row.innerHTML = '<td><strong>' + d.date + '</strong></td>' +
+						'<td>' + (d.sync_count || 0) + '</td>' +
+						'<td>' + (d.total_files || 0).toLocaleString() + '</td>' +
+						'<td>' + formatBytes(d.total_size || 0) + '</td>' +
+						'<td style="' + (d.total_failed > 0 ? 'color:#dc3545' : 'color:#28a745') + '">' + (d.total_failed || 0) + '</td>';
+					tbody.appendChild(row);
+				});
+			} else {
+				tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#666;padding:30px">No daily summary available</td></tr>';
+			}
+		})
+		.catch(function(err) {
+			document.getElementById('daily-body').innerHTML =
+				'<tr><td colspan="5" style="text-align:center;color:#dc3545;padding:30px">Failed to load summary: ' + err.message + '</td></tr>';
+		});
+}
+
 function loadUpdates() {
 	fetch('/api/updates/packages/recent?limit=50')
 		.then(response => response.json())
 		.then(data => {
 			var tbody = document.getElementById('updates-body');
 			tbody.innerHTML = '';
-			if (data.updates) {
+			if (data.updates && data.updates.length > 0) {
 				data.updates.forEach(function(u) {
 					var row = document.createElement('tr');
 					row.innerHTML = '<td>' + new Date(u.downloaded_date).toLocaleString() + '</td>' +
-						'<td>' + u.package_name + '</td>' +
-						'<td>' + u.package_version + '</td>' +
-						'<td>' + u.release + '</td>' +
-						'<td>' + u.component + '</td>' +
-						'<td>' + u.architecture + '</td>';
+						'<td>' + escapeHtml(u.package_name) + '</td>' +
+						'<td>' + escapeHtml(u.package_version) + '</td>' +
+						'<td>' + escapeHtml(u.release) + '</td>' +
+						'<td>' + escapeHtml(u.component) + '</td>' +
+						'<td>' + escapeHtml(u.architecture) + '</td>';
 					tbody.appendChild(row);
 				});
-			}
-			if (!data.updates || data.updates.length === 0) {
-				tbody.innerHTML = '<tr><td colspan="6" class="text-center">No updates recorded</td></tr>';
+			} else {
+				tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#666;padding:30px">No package updates recorded</td></tr>';
 			}
 		})
-		.catch(error => {
+		.catch(function(err) {
 			document.getElementById('updates-body').innerHTML =
-				'<tr><td colspan="6" class="text-center text-danger">Failed to load updates</td></tr>';
+				'<tr><td colspan="6" style="text-align:center;color:#dc3545;padding:30px">Failed to load updates: ' + err.message + '</td></tr>';
 		});
 }
 
-loadUpdates();
-setInterval(loadUpdates, 30000);
+function escapeHtml(text) {
+	if (!text) return '';
+	var div = document.createElement('div');
+	div.textContent = text;
+	return div.innerHTML;
+}
+
+// Initial load
+loadRepoStats();
+loadSyncEvents();
+setInterval(function() {
+	if (currentTab === 'sync-events') loadSyncEvents();
+	else if (currentTab === 'repo-stats') loadRepoStats();
+	else if (currentTab === 'daily') loadDailySummary();
+	else if (currentTab === 'package-updates') loadUpdates();
+}, 30000);
 </script>
 `
 

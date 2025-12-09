@@ -42,6 +42,12 @@ func main() {
 		case "cve":
 			handleCVECommand()
 			return
+		case "-setup", "--setup", "setup":
+			runSetup()
+			return
+		case "-uninstall", "--uninstall", "uninstall":
+			runUninstall()
+			return
 		case "version", "-version", "--version":
 			fmt.Printf("%s v%s\n", AppName, version)
 			os.Exit(0)
@@ -413,6 +419,8 @@ func printHelp() {
 	fmt.Printf("  %s [command] [options]\n\n", os.Args[0])
 	fmt.Println("Commands:")
 	fmt.Println("  (none)         Start daemon (default)")
+	fmt.Println("  -setup         Interactive setup wizard (creates user, config, systemd service)")
+	fmt.Println("  -uninstall     Remove service, config, and optionally data")
 	fmt.Println("  package        Manage custom packages (see 'package help')")
 	fmt.Println("  artica         Manage Artica packages (see 'artica help')")
 	fmt.Println("  gpg            Manage GPG keys (see 'gpg help')")
@@ -435,6 +443,11 @@ func printHelp() {
 	fmt.Println("\nSupported Debian versions:")
 	fmt.Println("  - Debian 12 (Bookworm)")
 	fmt.Println("  - Debian 13 (Trixie)")
+	fmt.Println("\nSupported Ubuntu versions:")
+	fmt.Println("  - Ubuntu 20.04 LTS (Focal Fossa)")
+	fmt.Println("  - Ubuntu 22.04 LTS (Jammy Jellyfish)")
+	fmt.Println("  - Ubuntu 24.04 LTS (Noble Numbat)")
+	fmt.Println("  - And other releases (archived releases use old-releases.ubuntu.com)")
 	fmt.Println("\nREST API Endpoints:")
 	fmt.Println("  GET  /api/status         - General status and statistics")
 	fmt.Println("  GET  /api/sync/stats     - Synchronization statistics")
@@ -475,10 +488,14 @@ func printHelp() {
 	fmt.Println("  GET  /api/cve/search?cve=<CVE-ID>        - Search for specific CVE")
 	fmt.Println("  GET  /api/cve/vulnerable                 - List vulnerable packages")
 	fmt.Println("\nExamples:")
+	fmt.Println("  # Run interactive setup wizard (as root)")
+	fmt.Printf("  sudo %s -setup\n\n", os.Args[0])
 	fmt.Println("  # Start with default config")
 	fmt.Printf("  %s\n\n", os.Args[0])
 	fmt.Println("  # Start with custom config")
 	fmt.Printf("  %s -config /etc/myconfig.json\n\n", os.Args[0])
+	fmt.Println("  # Uninstall (as root)")
+	fmt.Printf("  sudo %s -uninstall\n\n", os.Args[0])
 	fmt.Println("  # Check API status")
 	fmt.Println("  curl http://127.0.0.1:9090/api/status | jq")
 	fmt.Println("\n  # Trigger manual sync")

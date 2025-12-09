@@ -25,6 +25,19 @@ type ReleaseConfig struct {
 	Components     []string `json:"components,omitempty"`      // Override components for this release (e.g., no non-free-firmware for old releases)
 }
 
+// UbuntuReleaseConfig represents configuration for a specific Ubuntu release
+type UbuntuReleaseConfig struct {
+	Name          string   `json:"name"`                 // Release codename: "jammy", "noble", "focal", etc.
+	Mirror        string   `json:"mirror"`               // Mirror URL for this release (overrides default)
+	IsLTS         bool     `json:"is_lts"`               // True if this is an LTS release
+	IsArchived    bool     `json:"is_archived"`          // True if release is archived (uses old-releases.ubuntu.com)
+	SyncUpdates   bool     `json:"sync_updates"`         // Sync -updates pocket
+	SyncBackports bool     `json:"sync_backports"`       // Sync -backports pocket
+	SyncSecurity  bool     `json:"sync_security"`        // Sync -security pocket
+	SyncProposed  bool     `json:"sync_proposed"`        // Sync -proposed pocket (pre-release updates)
+	Components    []string `json:"components,omitempty"` // Override components for this release
+}
+
 // Config représente la configuration complète du démon
 type Config struct {
 	// Paramètres de synchronisation
@@ -39,6 +52,14 @@ type Config struct {
 	SyncContents         bool            `json:"sync_contents"`          // Télécharger les fichiers Contents pour la recherche (comme apt-file)
 	PackageSearchEnabled bool            `json:"package_search_enabled"` // Activer la recherche de packages
 	ConfigPath           string          `json:"config_path"`
+
+	// Paramètres Ubuntu
+	SyncUbuntuRepository bool                  `json:"sync_ubuntu_repository"` // Activer la synchronisation des dépôts Ubuntu
+	UbuntuMirror         string                `json:"ubuntu_mirror"`          // URL du miroir Ubuntu (default: http://archive.ubuntu.com/ubuntu)
+	UbuntuReleases       []string              `json:"ubuntu_releases"`        // ["jammy", "noble"] - liste des releases Ubuntu
+	UbuntuArchs          []string              `json:"ubuntu_architectures"`   // ["amd64", "arm64"]
+	UbuntuComponents     []string              `json:"ubuntu_components"`      // ["main", "restricted", "universe", "multiverse"]
+	UbuntuReleaseConfigs []UbuntuReleaseConfig `json:"ubuntu_release_configs"` // Configuration avancée par release (optionnel)
 
 	// Paramètres debian-installer (pour build-simple-cdd, netboot, etc.)
 	SyncDebianInstaller bool     `json:"sync_debian_installer"` // Activer la synchronisation debian-installer
@@ -137,6 +158,9 @@ type Config struct {
 	WebConsoleTLSKeyFile       string `json:"web_console_tls_key_file"`        // Clé TLS pour la console (si use_server_cert=false)
 	WebConsoleSessionSecret    string `json:"web_console_session_secret"`      // Secret pour les sessions (généré si vide)
 	WebConsoleSessionTimeout   int    `json:"web_console_session_timeout"`     // Timeout des sessions en minutes
+	WebConsoleBasePath         string `json:"web_console_base_path"`           // Base path for reverse proxy (e.g., "/console")
+	WebConsoleTrustedProxies   string `json:"web_console_trusted_proxies"`     // Comma-separated list of trusted proxy IPs/CIDRs
+	WebConsoleSecureCookies    bool   `json:"web_console_secure_cookies"`      // Force secure cookies (for HTTPS reverse proxy)
 
 	mu sync.RWMutex
 }
@@ -151,15 +175,22 @@ type MirrorConfig struct {
 // DefaultConfig retourne une configuration par défaut
 func DefaultConfig() *Config {
 	return &Config{
-		SyncInterval:                60, // 1 heure
-		RepositoryPath:              "/var/lib/ActiveDebianSync/mirror",
-		DebianMirror:                "http://deb.debian.org/debian",
-		DebianReleases:              []string{"bookworm", "trixie"},
-		DebianArchs:                 []string{"amd64"},
-		DebianComponents:            []string{"main", "contrib", "non-free", "non-free-firmware"},
-		SyncPackages:                true,                // Télécharger les packages par défaut
-		SyncContents:                true,                // Télécharger les fichiers Contents par défaut
-		PackageSearchEnabled:        true,                // Activer la recherche par défaut
+		SyncInterval:         60, // 1 heure
+		RepositoryPath:       "/var/lib/ActiveDebianSync/mirror",
+		DebianMirror:         "http://deb.debian.org/debian",
+		DebianReleases:       []string{"bookworm", "trixie"},
+		DebianArchs:          []string{"amd64"},
+		DebianComponents:     []string{"main", "contrib", "non-free", "non-free-firmware"},
+		SyncPackages:         true, // Télécharger les packages par défaut
+		SyncContents:         true, // Télécharger les fichiers Contents par défaut
+		PackageSearchEnabled: true, // Activer la recherche par défaut
+		// Ubuntu configuration
+		SyncUbuntuRepository:        false,                                                    // Désactivé par défaut
+		UbuntuMirror:                "http://archive.ubuntu.com/ubuntu",                       // Miroir officiel Ubuntu
+		UbuntuReleases:              []string{},                                               // Aucune release par défaut
+		UbuntuArchs:                 []string{"amd64"},                                        // amd64 par défaut
+		UbuntuComponents:            []string{"main", "restricted", "universe", "multiverse"}, // Tous les composants
+		UbuntuReleaseConfigs:        []UbuntuReleaseConfig{},
 		SyncDebianInstaller:         false,               // Désactivé par défaut (volumineux)
 		SyncInstallerUdebs:          true,                // Udebs activés si debian-installer est activé
 		SyncInstallerImages:         true,                // Images activées si debian-installer est activé
@@ -228,8 +259,11 @@ func DefaultConfig() *Config {
 		WebConsoleTLSUseServerCert: true, // Par défaut, utiliser le certificat du serveur HTTP
 		WebConsoleTLSCertFile:      "/etc/ActiveDebianSync/console.crt",
 		WebConsoleTLSKeyFile:       "/etc/ActiveDebianSync/console.key",
-		WebConsoleSessionSecret:    "", // Généré automatiquement si vide
-		WebConsoleSessionTimeout:   60, // 60 minutes
+		WebConsoleSessionSecret:    "",    // Généré automatiquement si vide
+		WebConsoleSessionTimeout:   60,    // 60 minutes
+		WebConsoleBasePath:         "",    // Empty = no base path
+		WebConsoleTrustedProxies:   "",    // Empty = trust localhost only
+		WebConsoleSecureCookies:    false, // Set to true when behind HTTPS proxy
 	}
 }
 
@@ -371,4 +405,78 @@ func filterComponents(components []string, toRemove string) []string {
 		}
 	}
 	return result
+}
+
+// GetUbuntuReleaseConfig returns the configuration for a specific Ubuntu release
+// If no specific config exists, returns a default config based on the release name
+func (c *Config) GetUbuntuReleaseConfig(releaseName string) UbuntuReleaseConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// Check if there's a specific config for this release
+	for _, rc := range c.UbuntuReleaseConfigs {
+		if rc.Name == releaseName {
+			return rc
+		}
+	}
+
+	// Return default config for this release
+	return c.defaultUbuntuReleaseConfig(releaseName)
+}
+
+// defaultUbuntuReleaseConfig returns a default UbuntuReleaseConfig for a release
+func (c *Config) defaultUbuntuReleaseConfig(releaseName string) UbuntuReleaseConfig {
+	// Known archived Ubuntu releases (EOL)
+	archivedReleases := map[string]bool{
+		"warty": true, "hoary": true, "breezy": true, "dapper": true,
+		"edgy": true, "feisty": true, "gutsy": true, "hardy": true,
+		"intrepid": true, "jaunty": true, "karmic": true, "lucid": true,
+		"maverick": true, "natty": true, "oneiric": true, "precise": true,
+		"quantal": true, "raring": true, "saucy": true, "trusty": true,
+		"utopic": true, "vivid": true, "wily": true, "xenial": true,
+		"yakkety": true, "zesty": true, "artful": true, "bionic": true,
+		"cosmic": true, "disco": true, "eoan": true, "groovy": true,
+		"hirsute": true, "impish": true, "kinetic": true, "lunar": true,
+		"mantic": true,
+	}
+
+	// Known LTS releases
+	ltsReleases := map[string]bool{
+		"dapper": true, "hardy": true, "lucid": true, "precise": true,
+		"trusty": true, "xenial": true, "bionic": true, "focal": true,
+		"jammy": true, "noble": true,
+	}
+
+	isArchived := archivedReleases[releaseName]
+	isLTS := ltsReleases[releaseName]
+
+	rc := UbuntuReleaseConfig{
+		Name:          releaseName,
+		Mirror:        c.UbuntuMirror,
+		IsLTS:         isLTS,
+		IsArchived:    isArchived,
+		SyncUpdates:   true,
+		SyncBackports: false,
+		SyncSecurity:  true,
+		SyncProposed:  false, // Proposed is pre-release, disabled by default
+		Components:    c.UbuntuComponents,
+	}
+
+	if isArchived {
+		rc.Mirror = "http://old-releases.ubuntu.com/ubuntu"
+	}
+
+	return rc
+}
+
+// GetAllUbuntuReleaseConfigs returns release configs for all configured Ubuntu releases
+func (c *Config) GetAllUbuntuReleaseConfigs() []UbuntuReleaseConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	configs := make([]UbuntuReleaseConfig, 0, len(c.UbuntuReleases))
+	for _, releaseName := range c.UbuntuReleases {
+		configs = append(configs, c.GetUbuntuReleaseConfig(releaseName))
+	}
+	return configs
 }

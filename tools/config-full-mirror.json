@@ -36,6 +36,9 @@
   "web_console_enabled": false,
   "web_console_port": 8090,
   "web_console_listen_addr": "0.0.0.0",
+  "web_console_base_path": "",
+  "web_console_trusted_proxies": "127.0.0.1",
+  "web_console_secure_cookies": true,
   "tls_cert_file": "/etc/ActiveDebianSync/server.crt",
   "tls_key_file": "/etc/ActiveDebianSync/server.key",
   "api_enabled": true,
@@ -47,5 +50,28 @@
   ],
   "max_disk_usage_percent": 85,
   "log_path": "/var/log/ActiveDebianSync/sync.log",
-  "access_log_path": "/var/log/ActiveDebianSync/access.log"
+  "access_log_path": "/var/log/ActiveDebianSync/access.log",
+  "sync_ubuntu_repository": false,
+  "ubuntu_mirror": "http://archive.ubuntu.com/ubuntu",
+  "ubuntu_releases": ["jammy", "noble"],
+  "ubuntu_architectures": ["amd64"],
+  "ubuntu_components": ["main", "restricted", "universe", "multiverse"],
+  "ubuntu_release_configs": [
+    {
+      "name": "jammy",
+      "is_lts": true,
+      "sync_updates": true,
+      "sync_backports": false,
+      "sync_security": true,
+      "sync_proposed": false
+    },
+    {
+      "name": "noble",
+      "is_lts": true,
+      "sync_updates": true,
+      "sync_backports": false,
+      "sync_security": true,
+      "sync_proposed": false
+    }
+  ]
 }

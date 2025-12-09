@@ -11,10 +11,12 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -29,6 +31,7 @@ type HTTPServerProvider interface {
 type SyncerProvider interface {
 	GetStats() interface{}
 	Sync()
+	ForceSync() error
 	IsRunning() bool
 }
 
@@ -49,19 +52,22 @@ type CVEScannerProvider interface {
 
 // WebConsole manages the web console server
 type WebConsole struct {
-	config        *config.Config
-	configPath    string
-	configDirName string
-	logger        *utils.Logger
-	usersDB       *database.UsersDB
-	server        *http.Server
-	httpServer    interface{}
-	syncer        interface{}
-	pkgManager    interface{}
-	cveScanner    CVEScannerProvider
-	templates     *template.Template
-	sessionSecret string
-	mu            sync.RWMutex
+	config         *config.Config
+	configPath     string
+	configDirName  string
+	logger         *utils.Logger
+	usersDB        *database.UsersDB
+	eventsDB       *database.EventsDB
+	server         *http.Server
+	httpServer     interface{}
+	syncer         interface{}
+	pkgManager     interface{}
+	cveScanner     CVEScannerProvider
+	templates      *template.Template
+	sessionSecret  string
+	basePath       string
+	trustedProxies []string
+	mu             sync.RWMutex
 }
 
 // TemplateData holds data for template rendering
@@ -96,13 +102,32 @@ func NewWebConsole(cfg *config.Config, configPath string, logger *utils.Logger) 
 		sessionSecret = hex.EncodeToString(bytes)
 	}
 
+	// Parse trusted proxies
+	var trustedProxies []string
+	if cfgData.WebConsoleTrustedProxies != "" {
+		for _, p := range strings.Split(cfgData.WebConsoleTrustedProxies, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				trustedProxies = append(trustedProxies, p)
+			}
+		}
+	}
+
+	// Normalize base path
+	basePath := strings.TrimSuffix(cfgData.WebConsoleBasePath, "/")
+	if basePath != "" && !strings.HasPrefix(basePath, "/") {
+		basePath = "/" + basePath
+	}
+
 	wc := &WebConsole{
-		config:        cfg,
-		configPath:    configPath,
-		configDirName: filepath.Base(filepath.Dir(configPath)),
-		logger:        logger,
-		usersDB:       usersDB,
-		sessionSecret: sessionSecret,
+		config:         cfg,
+		configPath:     configPath,
+		configDirName:  filepath.Base(filepath.Dir(configPath)),
+		logger:         logger,
+		usersDB:        usersDB,
+		sessionSecret:  sessionSecret,
+		basePath:       basePath,
+		trustedProxies: trustedProxies,
 	}
 
 	return wc, nil
@@ -118,6 +143,101 @@ func (wc *WebConsole) SetProviders(httpServer, syncer, pkgManager interface{}) {
 // SetCVEScanner sets the CVE scanner provider
 func (wc *WebConsole) SetCVEScanner(scanner CVEScannerProvider) {
 	wc.cveScanner = scanner
+}
+
+// SetEventsDB sets the events database for tracking sync events
+func (wc *WebConsole) SetEventsDB(db *database.EventsDB) {
+	wc.eventsDB = db
+}
+
+// GetEventsDB returns the events database
+func (wc *WebConsole) GetEventsDB() *database.EventsDB {
+	return wc.eventsDB
+}
+
+// isTrustedProxy checks if the given IP is a trusted proxy
+func (wc *WebConsole) isTrustedProxy(ip string) bool {
+	// Always trust localhost
+	if ip == "127.0.0.1" || ip == "::1" || ip == "localhost" {
+		return true
+	}
+
+	// Check against configured trusted proxies
+	for _, trusted := range wc.trustedProxies {
+		if strings.Contains(trusted, "/") {
+			// CIDR notation
+			_, cidr, err := net.ParseCIDR(trusted)
+			if err == nil {
+				testIP := net.ParseIP(ip)
+				if testIP != nil && cidr.Contains(testIP) {
+					return true
+				}
+			}
+		} else {
+			// Single IP
+			if trusted == ip {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// getClientIP extracts the real client IP from request, respecting X-Forwarded-For if from trusted proxy
+func (wc *WebConsole) getClientIP(r *http.Request) string {
+	// Get the remote address
+	remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if remoteIP == "" {
+		remoteIP = r.RemoteAddr
+	}
+
+	// Only trust X-Forwarded-For from trusted proxies
+	if wc.isTrustedProxy(remoteIP) {
+		// Check X-Forwarded-For header
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			// X-Forwarded-For can contain multiple IPs, take the first one
+			ips := strings.Split(xff, ",")
+			if len(ips) > 0 {
+				return strings.TrimSpace(ips[0])
+			}
+		}
+		// Check X-Real-IP header
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			return strings.TrimSpace(xri)
+		}
+	}
+
+	return remoteIP
+}
+
+// reverseProxyMiddleware handles reverse proxy headers and base path stripping
+func (wc *WebConsole) reverseProxyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Get remote IP for logging
+		remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if remoteIP == "" {
+			remoteIP = r.RemoteAddr
+		}
+
+		// Handle X-Forwarded-Proto for secure detection
+		if wc.isTrustedProxy(remoteIP) {
+			if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+				if proto == "https" {
+					r.URL.Scheme = "https"
+				}
+			}
+		}
+
+		// Strip base path if configured
+		if wc.basePath != "" && strings.HasPrefix(r.URL.Path, wc.basePath) {
+			r.URL.Path = strings.TrimPrefix(r.URL.Path, wc.basePath)
+			if r.URL.Path == "" {
+				r.URL.Path = "/"
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Start starts the web console server
@@ -151,8 +271,24 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 		}
 	}
 
+	// Use external assets if found, otherwise use embedded assets
+	var fileServer http.Handler
 	if _, err := os.Stat(staticPath); err == nil {
-		fileServer := http.FileServer(http.Dir(staticPath))
+		// Use external assets directory
+		fileServer = http.FileServer(http.Dir(staticPath))
+		wc.logger.LogInfo("Using external assets from: %s", staticPath)
+	} else if HasEmbeddedAssets() {
+		// Use embedded assets
+		embeddedFS, err := GetEmbeddedAssetsFS()
+		if err != nil {
+			wc.logger.LogError("Failed to load embedded assets: %v", err)
+		} else {
+			fileServer = http.FileServer(embeddedFS)
+			wc.logger.LogInfo("Using embedded assets (no external assets found)")
+		}
+	}
+
+	if fileServer != nil {
 		// Use config directory name as the root path (e.g., /ActiveDebianSync/*)
 		mux.Handle("/"+configDirName+"/", http.StripPrefix("/"+configDirName+"/", fileServer))
 		// Also keep /static/ for backwards compatibility
@@ -180,6 +316,8 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	// API routes for web console
 	mux.HandleFunc("/api/console/stats", wc.requireAuth(wc.handleAPIStats))
 	mux.HandleFunc("/api/console/sync/status", wc.requireAuth(wc.handleAPISyncStatus))
+	mux.HandleFunc("/api/console/sync/activity", wc.requireAuth(wc.handleAPISyncActivity))
+	mux.HandleFunc("/api/console/sync/failed-files", wc.requireAuth(wc.handleAPIFailedFiles))
 	mux.HandleFunc("/api/console/users", wc.requireAuth(wc.requireAdmin(wc.handleAPIUsers)))
 	mux.HandleFunc("/api/console/users/create", wc.requireAuth(wc.requireAdmin(wc.handleAPIUserCreate)))
 	mux.HandleFunc("/api/console/users/update", wc.requireAuth(wc.requireAdmin(wc.handleAPIUserUpdate)))
@@ -188,6 +326,9 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/console/config", wc.requireAuth(wc.requireAdmin(wc.handleAPIConfig)))
 	mux.HandleFunc("/api/console/config/update", wc.requireAuth(wc.requireAdmin(wc.handleAPIConfigUpdate)))
 	mux.HandleFunc("/api/updates/packages/recent", wc.requireAuth(wc.handleAPIRecentUpdates))
+	mux.HandleFunc("/api/console/events", wc.requireAuth(wc.handleAPISyncEvents))
+	mux.HandleFunc("/api/console/events/stats", wc.requireAuth(wc.handleAPIEventsStats))
+	mux.HandleFunc("/api/console/events/daily", wc.requireAuth(wc.handleAPIEventsDailySummary))
 	mux.HandleFunc("/api/search/package", wc.requireAuth(wc.handleAPISearchPackage))
 	mux.HandleFunc("/api/search/file", wc.requireAuth(wc.handleAPISearchFile))
 	mux.HandleFunc("/api/search/package-files", wc.requireAuth(wc.handleAPIPackageFiles))
@@ -202,9 +343,14 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/console/cve/search", wc.requireAuth(wc.handleAPICVESearch))
 
 	addr := fmt.Sprintf("%s:%d", cfg.WebConsoleListenAddr, cfg.WebConsolePort)
+
+	// Wrap mux with reverse proxy middleware
+	var handler http.Handler = mux
+	handler = wc.reverseProxyMiddleware(handler)
+
 	wc.server = &http.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: handler,
 	}
 
 	// Start session cleanup goroutine
@@ -326,23 +472,44 @@ func (wc *WebConsole) getSession(r *http.Request) *database.Session {
 
 // setSession sets the session cookie
 func (wc *WebConsole) setSession(w http.ResponseWriter, session *database.Session) {
+	cfg := wc.config.Get()
+	// Use secure cookies if HTTPS enabled or if explicitly set for reverse proxy
+	secureCookie := cfg.WebConsoleHTTPSEnabled || cfg.WebConsoleSecureCookies
+
+	// Cookie path should include base path if set
+	cookiePath := "/"
+	if wc.basePath != "" {
+		cookiePath = wc.basePath + "/"
+	}
+
+	// Use Lax SameSite when behind reverse proxy to allow navigation
+	sameSite := http.SameSiteStrictMode
+	if wc.basePath != "" || len(wc.trustedProxies) > 0 {
+		sameSite = http.SameSiteLaxMode
+	}
+
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session",
 		Value:    session.ID,
-		Path:     "/",
+		Path:     cookiePath,
 		HttpOnly: true,
-		Secure:   wc.config.Get().WebConsoleHTTPSEnabled,
-		SameSite: http.SameSiteStrictMode,
+		Secure:   secureCookie,
+		SameSite: sameSite,
 		Expires:  session.ExpiresAt,
 	})
 }
 
 // clearSession clears the session cookie
 func (wc *WebConsole) clearSession(w http.ResponseWriter) {
+	cookiePath := "/"
+	if wc.basePath != "" {
+		cookiePath = wc.basePath + "/"
+	}
+
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session",
 		Value:    "",
-		Path:     "/",
+		Path:     cookiePath,
 		HttpOnly: true,
 		MaxAge:   -1,
 	})
@@ -542,26 +709,49 @@ func (wc *WebConsole) handleCVEFind(w http.ResponseWriter, r *http.Request) {
 	wc.renderCVEFind(w, r, session)
 }
 
-// handleSyncTrigger triggers a sync
+// handleSyncTrigger triggers a forced sync (bypassing time restrictions)
 func (wc *WebConsole) handleSyncTrigger(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	session := wc.getSession(r)
+
+	// Check if sync is already running
 	if wc.syncer != nil {
-		if s, ok := wc.syncer.(interface{ Sync() }); ok {
-			go s.Sync()
+		v := reflect.ValueOf(wc.syncer)
+		isRunningMethod := v.MethodByName("IsRunning")
+		if isRunningMethod.IsValid() {
+			results := isRunningMethod.Call(nil)
+			if len(results) > 0 && results[0].Bool() {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"status":  "running",
+					"message": "Sync is already in progress",
+				})
+				return
+			}
 		}
 	}
 
-	session := wc.getSession(r)
-	wc.logger.LogInfo("User %s triggered sync", session.Username)
+	if wc.syncer != nil {
+		// Use ForceSync to bypass time restrictions
+		if s, ok := wc.syncer.(interface{ ForceSync() error }); ok {
+			go func() {
+				if err := s.ForceSync(); err != nil {
+					wc.logger.LogError("Forced sync failed: %v", err)
+				}
+			}()
+		}
+	}
+
+	wc.logger.LogInfo("User %s triggered forced sync", session.Username)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "success",
-		"message": "Sync triggered",
+		"message": "Sync started (time restrictions bypassed)",
 	})
 }
 
@@ -658,6 +848,74 @@ func (wc *WebConsole) handleAPISyncStatus(w http.ResponseWriter, r *http.Request
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
+}
+
+func (wc *WebConsole) handleAPIFailedFiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	failedFiles := []interface{}{}
+
+	if wc.syncer != nil {
+		v := reflect.ValueOf(wc.syncer)
+		getFailedFilesMethod := v.MethodByName("GetFailedFiles")
+		if getFailedFilesMethod.IsValid() {
+			results := getFailedFilesMethod.Call(nil)
+			if len(results) > 0 && !results[0].IsNil() {
+				failedFiles = make([]interface{}, results[0].Len())
+				for i := 0; i < results[0].Len(); i++ {
+					failedFiles[i] = results[0].Index(i).Interface()
+				}
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"count":        len(failedFiles),
+		"failed_files": failedFiles,
+	})
+}
+
+func (wc *WebConsole) handleAPISyncActivity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if wc.syncer == nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"active": false,
+		})
+		return
+	}
+
+	v := reflect.ValueOf(wc.syncer)
+	getActivityMethod := v.MethodByName("GetActivity")
+	if !getActivityMethod.IsValid() {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"active": false,
+		})
+		return
+	}
+
+	results := getActivityMethod.Call(nil)
+	if len(results) == 0 || results[0].IsNil() {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"active": false,
+		})
+		return
+	}
+
+	activity := results[0].Interface()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"active":   true,
+		"activity": activity,
+	})
 }
 
 func (wc *WebConsole) handleAPIRecentUpdates(w http.ResponseWriter, r *http.Request) {
@@ -935,6 +1193,9 @@ func (wc *WebConsole) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 		"debian_releases":                 cfg.DebianReleases,
 		"debian_architectures":            cfg.DebianArchs,
 		"debian_components":               cfg.DebianComponents,
+		"sync_allowed_hours_enabled":      cfg.SyncAllowedHoursEnabled,
+		"sync_allowed_hours_start":        cfg.SyncAllowedHoursStart,
+		"sync_allowed_hours_end":          cfg.SyncAllowedHoursEnd,
 		"http_enabled":                    cfg.HTTPEnabled,
 		"http_port":                       cfg.HTTPPort,
 		"https_enabled":                   cfg.HTTPSEnabled,
@@ -980,6 +1241,28 @@ func (wc *WebConsole) handleAPIConfigUpdate(w http.ResponseWriter, r *http.Reque
 		}
 		if v, ok := params["max_concurrent_downloads"].(float64); ok {
 			cfg.MaxConcurrentDownloads = int(v)
+		}
+		// Sync time restriction settings
+		if v, ok := params["sync_allowed_hours_enabled"].(bool); ok {
+			cfg.SyncAllowedHoursEnabled = v
+		}
+		if v, ok := params["sync_allowed_hours_start"].(string); ok && v != "" {
+			cfg.SyncAllowedHoursStart = v
+		}
+		if v, ok := params["sync_allowed_hours_end"].(string); ok && v != "" {
+			cfg.SyncAllowedHoursEnd = v
+		}
+		// Debian releases
+		if v, ok := params["debian_releases"].([]interface{}); ok {
+			releases := make([]string, 0, len(v))
+			for _, r := range v {
+				if rs, ok := r.(string); ok && rs != "" {
+					releases = append(releases, rs)
+				}
+			}
+			if len(releases) > 0 {
+				cfg.DebianReleases = releases
+			}
 		}
 		// SSL settings for web console
 		if v, ok := params["web_console_https_enabled"].(bool); ok {
@@ -1514,4 +1797,142 @@ func (wc *WebConsole) handleAPICVESearch(w http.ResponseWriter, r *http.Request)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
+}
+
+// handleAPISyncEvents returns recent sync events from the events database
+func (wc *WebConsole) handleAPISyncEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.eventsDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":  0,
+			"events": []interface{}{},
+			"error":  "Events database not initialized",
+		})
+		return
+	}
+
+	// Parse query parameters
+	limitStr := r.URL.Query().Get("limit")
+	limit := 100
+	if limitStr != "" {
+		if l, err := parseInt(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+
+	repository := r.URL.Query().Get("repository")
+
+	var events []database.SyncEvent
+	var err error
+
+	if repository != "" {
+		events, err = wc.eventsDB.GetEventsByRepository(repository, limit)
+	} else {
+		events, err = wc.eventsDB.GetRecentEvents(limit)
+	}
+
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":  0,
+			"events": []interface{}{},
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"count":  len(events),
+		"events": events,
+	})
+}
+
+// handleAPIEventsStats returns aggregated statistics per repository
+func (wc *WebConsole) handleAPIEventsStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.eventsDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"stats": []interface{}{},
+			"error": "Events database not initialized",
+		})
+		return
+	}
+
+	stats, err := wc.eventsDB.GetStatsByRepository()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"stats": []interface{}{},
+			"error": err.Error(),
+		})
+		return
+	}
+
+	totalCount, _ := wc.eventsDB.GetTotalEventCount()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"stats":       stats,
+		"total_count": totalCount,
+	})
+}
+
+// handleAPIEventsDailySummary returns daily summary of sync events
+func (wc *WebConsole) handleAPIEventsDailySummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.eventsDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"summary": []interface{}{},
+			"error":   "Events database not initialized",
+		})
+		return
+	}
+
+	// Parse days parameter
+	daysStr := r.URL.Query().Get("days")
+	days := 15
+	if daysStr != "" {
+		if d, err := parseInt(daysStr); err == nil && d > 0 {
+			days = d
+		}
+	}
+
+	summary, err := wc.eventsDB.GetDailySummary(days)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"summary": []interface{}{},
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"summary": summary,
+		"days":    days,
+	})
+}
+
+// parseInt is a helper function to parse integer from string
+func parseInt(s string) (int, error) {
+	var n int
+	_, err := fmt.Sscanf(s, "%d", &n)
+	return n, err
 }
