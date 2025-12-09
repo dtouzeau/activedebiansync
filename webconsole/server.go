@@ -75,6 +75,7 @@ type WebConsole struct {
 	pkgManager     interface{}
 	cveScanner     CVEScannerProvider
 	replicationMgr ReplicationManagerProvider
+	oauthHandler   *ConsoleOAuthHandler
 	templates      *template.Template
 	sessionSecret  string
 	basePath       string
@@ -141,6 +142,9 @@ func NewWebConsole(cfg *config.Config, configPath string, logger *utils.Logger) 
 		basePath:       basePath,
 		trustedProxies: trustedProxies,
 	}
+
+	// Initialize OAuth handler
+	wc.oauthHandler = NewConsoleOAuthHandler(cfg, logger)
 
 	return wc, nil
 }
@@ -340,6 +344,8 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	// Public routes
 	mux.HandleFunc("/login", wc.handleLogin)
 	mux.HandleFunc("/logout", wc.handleLogout)
+	mux.HandleFunc("/oauth/login", wc.handleOAuthLogin)
+	mux.HandleFunc("/oauth/callback", wc.handleOAuthCallback)
 
 	// Protected routes
 	mux.HandleFunc("/", wc.requireAuth(wc.handleDashboard))
@@ -620,12 +626,25 @@ func (wc *WebConsole) handleLogin(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/dashboard", http.StatusFound)
 			return
 		}
+
+		// If OAuth is enabled and local login is disabled, redirect to OAuth
+		if wc.oauthHandler.IsEnabled() && !wc.oauthHandler.AllowsLocalLogin() {
+			http.Redirect(w, r, "/oauth/login", http.StatusFound)
+			return
+		}
+
 		wc.renderLogin(w, r, "")
 		return
 	}
 
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Check if local login is allowed
+	if wc.oauthHandler.IsEnabled() && !wc.oauthHandler.AllowsLocalLogin() {
+		wc.renderLogin(w, r, "Local login is disabled. Please use OAuth.")
 		return
 	}
 
@@ -661,6 +680,79 @@ func (wc *WebConsole) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	wc.clearSession(w)
 	http.Redirect(w, r, "/login", http.StatusFound)
+}
+
+// handleOAuthLogin initiates OAuth login flow
+func (wc *WebConsole) handleOAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if !wc.oauthHandler.IsEnabled() {
+		http.Error(w, "OAuth is not enabled", http.StatusBadRequest)
+		return
+	}
+
+	// Get return URL from query parameter
+	returnURL := r.URL.Query().Get("return")
+	if returnURL == "" {
+		returnURL = "/dashboard"
+	}
+
+	authURL, err := wc.oauthHandler.GetAuthorizationURL(returnURL)
+	if err != nil {
+		wc.logger.LogError("Failed to get OAuth authorization URL: %v", err)
+		http.Error(w, "Failed to initiate OAuth login", http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+// handleOAuthCallback handles the OAuth callback
+func (wc *WebConsole) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	if !wc.oauthHandler.IsEnabled() {
+		http.Error(w, "OAuth is not enabled", http.StatusBadRequest)
+		return
+	}
+
+	// Check for error from OAuth provider
+	if errParam := r.URL.Query().Get("error"); errParam != "" {
+		errDesc := r.URL.Query().Get("error_description")
+		wc.logger.LogError("OAuth error: %s - %s", errParam, errDesc)
+		wc.renderLogin(w, r, fmt.Sprintf("OAuth error: %s", errDesc))
+		return
+	}
+
+	code := r.URL.Query().Get("code")
+	state := r.URL.Query().Get("state")
+
+	if code == "" || state == "" {
+		wc.renderLogin(w, r, "Invalid OAuth callback")
+		return
+	}
+
+	result, err := wc.oauthHandler.HandleCallback(code, state)
+	if err != nil {
+		wc.logger.LogError("OAuth callback failed: %v", err)
+		wc.renderLogin(w, r, "OAuth authentication failed")
+		return
+	}
+
+	// Create session for the OAuth user
+	cfg := wc.config.Get()
+	session, err := wc.usersDB.CreateOAuthSession(result.Username, result.IsAdmin, result.AccessToken, cfg.WebConsoleSessionTimeout)
+	if err != nil {
+		wc.logger.LogError("Failed to create OAuth session: %v", err)
+		wc.renderLogin(w, r, "Failed to create session")
+		return
+	}
+
+	wc.setSession(w, session)
+	wc.logger.LogInfo("OAuth user %s logged in (admin: %v)", result.Username, result.IsAdmin)
+
+	// Redirect to return URL or dashboard
+	returnURL := result.ReturnURL
+	if returnURL == "" {
+		returnURL = "/dashboard"
+	}
+	http.Redirect(w, r, returnURL, http.StatusFound)
 }
 
 // handleDashboard handles the dashboard page

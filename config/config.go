@@ -166,6 +166,19 @@ type Config struct {
 	WebConsoleTrustedProxies   string `json:"web_console_trusted_proxies"`     // Comma-separated list of trusted proxy IPs/CIDRs
 	WebConsoleSecureCookies    bool   `json:"web_console_secure_cookies"`      // Force secure cookies (for HTTPS reverse proxy)
 
+	// Web Console OAuth Settings
+	WebConsoleOAuthEnabled      bool   `json:"web_console_oauth_enabled"`       // Enable OAuth authentication
+	WebConsoleOAuthProvider     string `json:"web_console_oauth_provider"`      // OAuth provider name (for display)
+	WebConsoleOAuthClientID     string `json:"web_console_oauth_client_id"`     // OAuth client ID
+	WebConsoleOAuthClientSecret string `json:"web_console_oauth_client_secret"` // OAuth client secret
+	WebConsoleOAuthAuthURL      string `json:"web_console_oauth_auth_url"`      // OAuth authorization endpoint
+	WebConsoleOAuthTokenURL     string `json:"web_console_oauth_token_url"`     // OAuth token endpoint
+	WebConsoleOAuthUserInfoURL  string `json:"web_console_oauth_userinfo_url"`  // OAuth userinfo endpoint (optional)
+	WebConsoleOAuthScopes       string `json:"web_console_oauth_scopes"`        // OAuth scopes (space-separated)
+	WebConsoleOAuthRedirectURL  string `json:"web_console_oauth_redirect_url"`  // OAuth redirect URL (auto-generated if empty)
+	WebConsoleOAuthAdminGroup   string `json:"web_console_oauth_admin_group"`   // Group/role that grants admin access
+	WebConsoleOAuthAllowLocal   bool   `json:"web_console_oauth_allow_local"`   // Allow local login when OAuth is enabled
+
 	// Cluster Replication Settings
 	ClusterEnabled        bool          `json:"cluster_enabled"`         // Enable cluster replication
 	ClusterNodeName       string        `json:"cluster_node_name"`       // Unique node identifier
@@ -291,6 +304,19 @@ func DefaultConfig() *Config {
 		WebConsoleBasePath:         "",    // Empty = no base path
 		WebConsoleTrustedProxies:   "",    // Empty = trust localhost only
 		WebConsoleSecureCookies:    false, // Set to true when behind HTTPS proxy
+
+		// Web Console OAuth
+		WebConsoleOAuthEnabled:      false,                  // OAuth disabled by default
+		WebConsoleOAuthProvider:     "",                     // Provider name (e.g., "Keycloak", "Azure AD")
+		WebConsoleOAuthClientID:     "",                     // OAuth client ID
+		WebConsoleOAuthClientSecret: "",                     // OAuth client secret
+		WebConsoleOAuthAuthURL:      "",                     // Authorization endpoint
+		WebConsoleOAuthTokenURL:     "",                     // Token endpoint
+		WebConsoleOAuthUserInfoURL:  "",                     // UserInfo endpoint (optional)
+		WebConsoleOAuthScopes:       "openid profile email", // Default scopes
+		WebConsoleOAuthRedirectURL:  "",                     // Auto-generated if empty
+		WebConsoleOAuthAdminGroup:   "admin",                // Default admin group
+		WebConsoleOAuthAllowLocal:   true,                   // Allow local login by default
 
 		// Cluster Replication
 		ClusterEnabled:        false,          // Disabled by default

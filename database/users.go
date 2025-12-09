@@ -475,3 +475,74 @@ func (u *UsersDB) Close() error {
 func (u *UsersDB) GetDBPath() string {
 	return u.dbPath
 }
+
+// CreateOAuthSession creates a session for an OAuth-authenticated user
+// If the user doesn't exist, it creates them as an OAuth user
+func (u *UsersDB) CreateOAuthSession(username string, isAdmin bool, accessToken string, timeoutMinutes int) (*Session, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	// Check if user exists
+	var userID int64
+	var role string
+	err := u.db.QueryRow("SELECT id, role FROM users WHERE username = ?", username).Scan(&userID, &role)
+
+	if err == sql.ErrNoRows {
+		// Create new OAuth user (no password)
+		role = "user"
+		if isAdmin {
+			role = "admin"
+		}
+
+		result, err := u.db.Exec(`
+			INSERT INTO users (username, password_hash, salt, role, active, created_at, updated_at)
+			VALUES (?, 'oauth', 'oauth', ?, 1, ?, ?)
+		`, username, role, time.Now(), time.Now())
+		if err != nil {
+			return nil, fmt.Errorf("failed to create OAuth user: %w", err)
+		}
+
+		userID, err = result.LastInsertId()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get user ID: %w", err)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to check user: %w", err)
+	} else {
+		// Update role if admin status changed
+		if isAdmin && role != "admin" {
+			u.db.Exec("UPDATE users SET role = 'admin', updated_at = ? WHERE id = ?", time.Now(), userID)
+			role = "admin"
+		}
+	}
+
+	// Update last login
+	u.db.Exec("UPDATE users SET last_login = ? WHERE id = ?", time.Now(), userID)
+
+	// Create session
+	sessionID, err := generateSessionID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate session ID: %w", err)
+	}
+
+	now := time.Now()
+	expiresAt := now.Add(time.Duration(timeoutMinutes) * time.Minute)
+
+	_, err = u.db.Exec(`
+		INSERT INTO sessions (id, user_id, created_at, expires_at)
+		VALUES (?, ?, ?, ?)
+	`, sessionID, userID, now, expiresAt)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session: %w", err)
+	}
+
+	return &Session{
+		ID:        sessionID,
+		UserID:    userID,
+		Username:  username,
+		Role:      role,
+		CreatedAt: now,
+		ExpiresAt: expiresAt,
+	}, nil
+}
