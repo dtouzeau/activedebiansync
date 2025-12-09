@@ -1265,6 +1265,8 @@ func (wc *WebConsole) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 		"web_console_tls_key_file":        cfg.WebConsoleTLSKeyFile,
 		"sync_artica_repository":          cfg.SyncArticaRepository,
 		"artica_repository_ssl":           cfg.ArticaRepositorySSL,
+		"sync_translations":               cfg.SyncTranslations,
+		"translation_languages":           cfg.TranslationLanguages,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
