@@ -171,6 +171,12 @@ type Config struct {
 	ClusterNodeName       string        `json:"cluster_node_name"`       // Unique node identifier
 	ClusterPort           int           `json:"cluster_port"`            // TCP port for replication (default: 9191)
 	ClusterAuthToken      string        `json:"cluster_auth_token"`      // Shared secret for authentication
+	ClusterAuthMode       string        `json:"cluster_auth_mode"`       // "token" or "oauth"
+	ClusterOAuthEnabled   bool          `json:"cluster_oauth_enabled"`   // Enable OAuth for peer authentication
+	ClusterOAuthClientID  string        `json:"cluster_oauth_client_id"` // OAuth client ID
+	ClusterOAuthSecret    string        `json:"cluster_oauth_secret"`    // OAuth client secret
+	ClusterOAuthTokenURL  string        `json:"cluster_oauth_token_url"` // OAuth token endpoint URL
+	ClusterOAuthScopes    string        `json:"cluster_oauth_scopes"`    // OAuth scopes (comma-separated)
 	ClusterPeers          []ClusterPeer `json:"cluster_peers"`           // List of peer nodes
 	ClusterAutoReplicate  bool          `json:"cluster_auto_replicate"`  // Trigger replication after sync
 	ClusterCompression    string        `json:"cluster_compression"`     // "zstd", "gzip", "none"
@@ -287,10 +293,16 @@ func DefaultConfig() *Config {
 		WebConsoleSecureCookies:    false, // Set to true when behind HTTPS proxy
 
 		// Cluster Replication
-		ClusterEnabled:        false, // Disabled by default
-		ClusterNodeName:       "",    // Generated on first run if empty
-		ClusterPort:           9191,  // Default replication port
-		ClusterAuthToken:      "",    // Generated on first run if empty
+		ClusterEnabled:        false,          // Disabled by default
+		ClusterNodeName:       "",             // Generated on first run if empty
+		ClusterPort:           9191,           // Default replication port
+		ClusterAuthToken:      "",             // Generated on first run if empty
+		ClusterAuthMode:       "token",        // Default to token auth
+		ClusterOAuthEnabled:   false,          // OAuth disabled by default
+		ClusterOAuthClientID:  "",             // OAuth client ID
+		ClusterOAuthSecret:    "",             // OAuth client secret
+		ClusterOAuthTokenURL:  "",             // OAuth token endpoint
+		ClusterOAuthScopes:    "cluster:sync", // Default OAuth scopes
 		ClusterPeers:          []ClusterPeer{},
 		ClusterAutoReplicate:  true,   // Auto-replicate after sync
 		ClusterCompression:    "zstd", // Best compression/speed ratio

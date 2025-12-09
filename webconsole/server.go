@@ -413,6 +413,7 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/console/cluster/nodes/remove", wc.requireAuth(wc.requireAdmin(wc.handleAPIClusterNodeRemove)))
 	mux.HandleFunc("/api/console/cluster/replicate", wc.requireAuth(wc.handleAPIClusterReplicate))
 	mux.HandleFunc("/api/console/cluster/history", wc.requireAuth(wc.handleAPIClusterHistory))
+	mux.HandleFunc("/api/console/cluster/oauth", wc.requireAuth(wc.requireAdmin(wc.handleAPIClusterOAuth)))
 
 	addr := fmt.Sprintf("%s:%d", cfg.WebConsoleListenAddr, cfg.WebConsolePort)
 
@@ -2547,10 +2548,16 @@ func (wc *WebConsole) handleAPIClusterStatus(w http.ResponseWriter, r *http.Requ
 		"enabled":         cfg.ClusterEnabled,
 		"node_name":       cfg.ClusterNodeName,
 		"port":            cfg.ClusterPort,
+		"auth_mode":       cfg.ClusterAuthMode,
 		"auto_replicate":  cfg.ClusterAutoReplicate,
 		"compression":     cfg.ClusterCompression,
 		"bandwidth_limit": cfg.ClusterBandwidthLimit,
 		"peers_count":     len(cfg.ClusterPeers),
+		// OAuth settings (don't expose secret)
+		"oauth_enabled":   cfg.ClusterOAuthEnabled,
+		"oauth_token_url": cfg.ClusterOAuthTokenURL,
+		"oauth_client_id": cfg.ClusterOAuthClientID,
+		"oauth_scopes":    cfg.ClusterOAuthScopes,
 	}
 
 	// Include replication status if available
@@ -2830,4 +2837,73 @@ func (wc *WebConsole) handleAPIClusterHistory(w http.ResponseWriter, r *http.Req
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"events": events})
+}
+
+// handleAPIClusterOAuth handles OAuth configuration updates
+func (wc *WebConsole) handleAPIClusterOAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		AuthMode          string `json:"auth_mode"`
+		AuthToken         string `json:"auth_token"`
+		OAuthEnabled      bool   `json:"oauth_enabled"`
+		OAuthTokenURL     string `json:"oauth_token_url"`
+		OAuthClientID     string `json:"oauth_client_id"`
+		OAuthClientSecret string `json:"oauth_client_secret"`
+		OAuthScopes       string `json:"oauth_scopes"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Invalid request body",
+		})
+		return
+	}
+
+	// Update config
+	wc.config.Update(func(c *config.Config) {
+		if req.AuthMode != "" {
+			c.ClusterAuthMode = req.AuthMode
+		}
+		if req.AuthToken != "" {
+			c.ClusterAuthToken = req.AuthToken
+		}
+		c.ClusterOAuthEnabled = req.OAuthEnabled
+		if req.OAuthTokenURL != "" {
+			c.ClusterOAuthTokenURL = req.OAuthTokenURL
+		}
+		if req.OAuthClientID != "" {
+			c.ClusterOAuthClientID = req.OAuthClientID
+		}
+		if req.OAuthClientSecret != "" {
+			c.ClusterOAuthSecret = req.OAuthClientSecret
+		}
+		if req.OAuthScopes != "" {
+			c.ClusterOAuthScopes = req.OAuthScopes
+		}
+	})
+
+	// Save config
+	if err := wc.config.Save(wc.configPath); err != nil {
+		wc.logger.LogError("Failed to save OAuth config: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Failed to save configuration",
+		})
+		return
+	}
+
+	wc.logger.LogInfo("Cluster OAuth settings updated (auth_mode: %s, oauth_enabled: %v)", req.AuthMode, req.OAuthEnabled)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"message": "OAuth settings saved successfully",
+	})
 }

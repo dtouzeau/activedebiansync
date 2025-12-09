@@ -37,6 +37,7 @@ type HandshakePayload struct {
 	Version     uint8  `json:"version"`
 	NodeName    string `json:"node_name"`
 	AuthToken   string `json:"auth_token"`
+	AuthMode    string `json:"auth_mode,omitempty"` // "token" or "oauth"
 	Compression string `json:"compression"`
 	Mode        string `json:"mode"` // "push" or "pull"
 }
@@ -81,11 +82,11 @@ type FileDataPayload struct {
 
 // ProgressPayload reports transfer progress
 type ProgressPayload struct {
-	TotalFiles   int64 `json:"total_files"`
-	FilesDone    int64 `json:"files_done"`
-	TotalBytes   int64 `json:"total_bytes"`
-	BytesDone    int64 `json:"bytes_done"`
-	CurrentFile  string `json:"current_file"`
+	TotalFiles  int64  `json:"total_files"`
+	FilesDone   int64  `json:"files_done"`
+	TotalBytes  int64  `json:"total_bytes"`
+	BytesDone   int64  `json:"bytes_done"`
+	CurrentFile string `json:"current_file"`
 }
 
 // ErrorPayload reports an error
@@ -139,11 +140,12 @@ func ReadMessage(r io.Reader) (*Message, error) {
 }
 
 // NewHandshakeMessage creates a handshake message
-func NewHandshakeMessage(nodeName, authToken, compression, mode string) (*Message, error) {
+func NewHandshakeMessage(nodeName, authToken, authMode, compression, mode string) (*Message, error) {
 	payload := HandshakePayload{
 		Version:     ProtocolVersion,
 		NodeName:    nodeName,
 		AuthToken:   authToken,
+		AuthMode:    authMode,
 		Compression: compression,
 		Mode:        mode,
 	}

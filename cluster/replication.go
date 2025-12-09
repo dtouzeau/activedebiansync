@@ -18,18 +18,18 @@ import (
 
 // ReplicationStatus represents the current state of replication
 type ReplicationStatus struct {
-	Running       bool      `json:"running"`
-	CurrentPeer   string    `json:"current_peer"`
-	Direction     string    `json:"direction"` // "push" or "pull"
-	Progress      float64   `json:"progress"`  // 0-100
-	CurrentFile   string    `json:"current_file"`
-	FilesTotal    int64     `json:"files_total"`
-	FilesDone     int64     `json:"files_done"`
-	BytesTotal    int64     `json:"bytes_total"`
-	BytesDone     int64     `json:"bytes_done"`
-	StartTime     time.Time `json:"start_time"`
-	EstimatedEnd  time.Time `json:"estimated_end"`
-	ErrorMessage  string    `json:"error_message,omitempty"`
+	Running      bool      `json:"running"`
+	CurrentPeer  string    `json:"current_peer"`
+	Direction    string    `json:"direction"` // "push" or "pull"
+	Progress     float64   `json:"progress"`  // 0-100
+	CurrentFile  string    `json:"current_file"`
+	FilesTotal   int64     `json:"files_total"`
+	FilesDone    int64     `json:"files_done"`
+	BytesTotal   int64     `json:"bytes_total"`
+	BytesDone    int64     `json:"bytes_done"`
+	StartTime    time.Time `json:"start_time"`
+	EstimatedEnd time.Time `json:"estimated_end"`
+	ErrorMessage string    `json:"error_message,omitempty"`
 }
 
 // ReplicationManager handles cluster replication
@@ -38,15 +38,16 @@ type ReplicationManager struct {
 	logger    *utils.Logger
 	clusterDB *database.ClusterDB
 
-	listener   net.Listener
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	listener net.Listener
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
 
-	status     ReplicationStatus
-	statusMu   sync.RWMutex
+	status   ReplicationStatus
+	statusMu sync.RWMutex
 
-	compressor *Compressor
+	compressor  *Compressor
+	oauthClient *OAuthClient
 
 	// Track active connections
 	activeConns   map[string]net.Conn
@@ -60,6 +61,7 @@ func NewReplicationManager(cfg *config.Config, logger *utils.Logger, clusterDB *
 		logger:      logger,
 		clusterDB:   clusterDB,
 		compressor:  NewCompressor(cfg.ClusterCompression),
+		oauthClient: NewOAuthClient(cfg, logger),
 		activeConns: make(map[string]net.Conn),
 	}
 }
@@ -78,8 +80,16 @@ func (rm *ReplicationManager) Start(ctx context.Context) error {
 	if cfg.ClusterNodeName == "" {
 		return fmt.Errorf("cluster_node_name is required when cluster is enabled")
 	}
-	if cfg.ClusterAuthToken == "" {
-		return fmt.Errorf("cluster_auth_token is required when cluster is enabled")
+	// Validate authentication configuration
+	if cfg.ClusterAuthMode == "oauth" {
+		if !cfg.ClusterOAuthEnabled {
+			return fmt.Errorf("cluster_oauth_enabled must be true when cluster_auth_mode is 'oauth'")
+		}
+		if cfg.ClusterOAuthTokenURL == "" || cfg.ClusterOAuthClientID == "" || cfg.ClusterOAuthSecret == "" {
+			return fmt.Errorf("OAuth configuration (token_url, client_id, secret) is required when cluster_auth_mode is 'oauth'")
+		}
+	} else if cfg.ClusterAuthToken == "" {
+		return fmt.Errorf("cluster_auth_token is required when cluster is enabled with token auth mode")
 	}
 
 	// Start TCP listener
@@ -205,8 +215,12 @@ func (rm *ReplicationManager) handleConnection(conn net.Conn) {
 
 	// Verify authentication
 	cfg := rm.config.Get()
-	if handshake.AuthToken != cfg.ClusterAuthToken {
-		rm.logger.LogError("Authentication failed from %s (node: %s)", remoteAddr, handshake.NodeName)
+	authMode := handshake.AuthMode
+	if authMode == "" {
+		authMode = "token" // Default to token auth for backward compatibility
+	}
+	if err := rm.oauthClient.ValidateAuthToken(handshake.AuthToken, authMode); err != nil {
+		rm.logger.LogError("Authentication failed from %s (node: %s, mode: %s): %v", remoteAddr, handshake.NodeName, authMode, err)
 		ackMsg, _ := NewHandshakeAckMessage(false, cfg.ClusterNodeName, "authentication failed")
 		WriteMessage(conn, ackMsg)
 		return
@@ -359,11 +373,11 @@ func (rm *ReplicationManager) handlePullRequest(conn net.Conn, handshake *Handsh
 	// Update status
 	rm.statusMu.Lock()
 	rm.status = ReplicationStatus{
-		Running:    true,
+		Running:     true,
 		CurrentPeer: handshake.NodeName,
-		Direction:  "push",
-		FilesTotal: int64(len(fileReq.Files)),
-		StartTime:  startTime,
+		Direction:   "push",
+		FilesTotal:  int64(len(fileReq.Files)),
+		StartTime:   startTime,
 	}
 	rm.statusMu.Unlock()
 
@@ -547,11 +561,11 @@ func (rm *ReplicationManager) handlePushRequest(conn net.Conn, handshake *Handsh
 	// Update status
 	rm.statusMu.Lock()
 	rm.status = ReplicationStatus{
-		Running:    true,
+		Running:     true,
 		CurrentPeer: handshake.NodeName,
-		Direction:  "pull",
-		FilesTotal: int64(len(neededFiles)),
-		StartTime:  startTime,
+		Direction:   "pull",
+		FilesTotal:  int64(len(neededFiles)),
+		StartTime:   startTime,
 	}
 	rm.statusMu.Unlock()
 
@@ -769,8 +783,16 @@ func (rm *ReplicationManager) replicateToPeer(peer config.ClusterPeer) error {
 	}
 	defer conn.Close()
 
+	// Get authentication token (OAuth or static)
+	authToken, authMode, err := rm.oauthClient.GetAuthToken()
+	if err != nil {
+		status = "failed"
+		errorMessage = err.Error()
+		return fmt.Errorf("failed to get auth token: %w", err)
+	}
+
 	// Send handshake
-	handshakeMsg, err := NewHandshakeMessage(cfg.ClusterNodeName, cfg.ClusterAuthToken, cfg.ClusterCompression, "push")
+	handshakeMsg, err := NewHandshakeMessage(cfg.ClusterNodeName, authToken, authMode, cfg.ClusterCompression, "push")
 	if err != nil {
 		status = "failed"
 		errorMessage = err.Error()
@@ -880,11 +902,11 @@ func (rm *ReplicationManager) replicateToPeer(peer config.ClusterPeer) error {
 	// Update status
 	rm.statusMu.Lock()
 	rm.status = ReplicationStatus{
-		Running:    true,
+		Running:     true,
 		CurrentPeer: peer.Name,
-		Direction:  "push",
-		FilesTotal: int64(len(fileReq.Files)),
-		StartTime:  startTime,
+		Direction:   "push",
+		FilesTotal:  int64(len(fileReq.Files)),
+		StartTime:   startTime,
 	}
 	rm.statusMu.Unlock()
 
@@ -1018,8 +1040,16 @@ func (rm *ReplicationManager) pullFromPeer(peer config.ClusterPeer) error {
 	}
 	defer conn.Close()
 
+	// Get authentication token (OAuth or static)
+	authToken, authMode, err := rm.oauthClient.GetAuthToken()
+	if err != nil {
+		status = "failed"
+		errorMessage = err.Error()
+		return fmt.Errorf("failed to get auth token: %w", err)
+	}
+
 	// Send handshake with pull mode
-	handshakeMsg, err := NewHandshakeMessage(cfg.ClusterNodeName, cfg.ClusterAuthToken, cfg.ClusterCompression, "pull")
+	handshakeMsg, err := NewHandshakeMessage(cfg.ClusterNodeName, authToken, authMode, cfg.ClusterCompression, "pull")
 	if err != nil {
 		status = "failed"
 		errorMessage = err.Error()
@@ -1125,11 +1155,11 @@ func (rm *ReplicationManager) pullFromPeer(peer config.ClusterPeer) error {
 	// Update status
 	rm.statusMu.Lock()
 	rm.status = ReplicationStatus{
-		Running:    true,
+		Running:     true,
 		CurrentPeer: peer.Name,
-		Direction:  "pull",
-		FilesTotal: int64(len(neededFiles)),
-		StartTime:  startTime,
+		Direction:   "pull",
+		FilesTotal:  int64(len(neededFiles)),
+		StartTime:   startTime,
 	}
 	rm.statusMu.Unlock()
 

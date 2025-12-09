@@ -93,9 +93,26 @@ func (wc *WebConsole) renderCluster(w http.ResponseWriter, r *http.Request, sess
 				<tr><td><strong>Enabled</strong></td><td id="cluster-enabled">-</td></tr>
 				<tr><td><strong>Node Name</strong></td><td id="cluster-node-name">-</td></tr>
 				<tr><td><strong>Port</strong></td><td id="cluster-port">-</td></tr>
+				<tr><td><strong>Auth Mode</strong></td><td id="cluster-auth-mode">-</td></tr>
 				<tr><td><strong>Auto Replicate</strong></td><td id="cluster-auto">-</td></tr>
 				<tr><td><strong>Compression</strong></td><td id="cluster-compression">-</td></tr>
 				<tr><td><strong>Bandwidth Limit</strong></td><td id="cluster-bandwidth">-</td></tr>
+			</table>
+		</div>
+	</div>
+	<div class="card" style="margin-top:20px">
+		<div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
+			<span>OAuth Settings</span>
+			<button class="btn btn-sm btn-secondary" onclick="showOAuthModal()" id="oauth-edit-btn">
+				<i class="material-icons">edit</i> Configure
+			</button>
+		</div>
+		<div class="card-body">
+			<table class="table">
+				<tr><td><strong>OAuth Enabled</strong></td><td id="oauth-enabled">-</td></tr>
+				<tr><td><strong>Token URL</strong></td><td id="oauth-token-url" style="word-break:break-all">-</td></tr>
+				<tr><td><strong>Client ID</strong></td><td id="oauth-client-id">-</td></tr>
+				<tr><td><strong>Scopes</strong></td><td id="oauth-scopes">-</td></tr>
 			</table>
 		</div>
 	</div>
@@ -155,6 +172,59 @@ func (wc *WebConsole) renderCluster(w http.ResponseWriter, r *http.Request, sess
 	</div>
 </div>
 
+<!-- OAuth Settings Modal -->
+<div id="oauth-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+	<div style="background:#fff;border-radius:8px;width:500px;max-width:90%">
+		<div style="padding:20px;border-bottom:1px solid #e0e0e0;font-weight:600">OAuth Configuration</div>
+		<div style="padding:20px">
+			<div style="margin-bottom:15px">
+				<label style="display:block;margin-bottom:5px;font-weight:500">Authentication Mode</label>
+				<select id="oauth-auth-mode" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px">
+					<option value="token">Token (Shared Secret)</option>
+					<option value="oauth">OAuth 2.0</option>
+				</select>
+			</div>
+			<div id="oauth-fields" style="display:none">
+				<div style="margin-bottom:15px">
+					<label style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+						<input type="checkbox" id="oauth-enabled-check">
+						<span>Enable OAuth</span>
+					</label>
+				</div>
+				<div style="margin-bottom:15px">
+					<label style="display:block;margin-bottom:5px;font-weight:500">Token URL</label>
+					<input type="text" id="oauth-token-url-input" class="form-control" placeholder="https://auth.example.com/oauth/token" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px">
+				</div>
+				<div style="margin-bottom:15px">
+					<label style="display:block;margin-bottom:5px;font-weight:500">Client ID</label>
+					<input type="text" id="oauth-client-id-input" class="form-control" placeholder="your-client-id" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px">
+				</div>
+				<div style="margin-bottom:15px">
+					<label style="display:block;margin-bottom:5px;font-weight:500">Client Secret</label>
+					<input type="password" id="oauth-client-secret-input" class="form-control" placeholder="your-client-secret" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px">
+					<small style="color:#666">Leave blank to keep existing secret</small>
+				</div>
+				<div style="margin-bottom:15px">
+					<label style="display:block;margin-bottom:5px;font-weight:500">Scopes</label>
+					<input type="text" id="oauth-scopes-input" class="form-control" placeholder="cluster:sync" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px">
+					<small style="color:#666">Space or comma separated</small>
+				</div>
+			</div>
+			<div id="token-fields">
+				<div style="margin-bottom:15px">
+					<label style="display:block;margin-bottom:5px;font-weight:500">Auth Token</label>
+					<input type="password" id="oauth-auth-token-input" class="form-control" placeholder="shared-secret-token" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px">
+					<small style="color:#666">Leave blank to keep existing token</small>
+				</div>
+			</div>
+		</div>
+		<div style="padding:15px 20px;border-top:1px solid #e0e0e0;display:flex;justify-content:flex-end;gap:10px">
+			<button class="btn btn-secondary" onclick="hideOAuthModal()">Cancel</button>
+			<button class="btn btn-primary" onclick="saveOAuthSettings()">Save</button>
+		</div>
+	</div>
+</div>
+
 <script>
 function formatBytes(bytes) {
 	if (bytes === 0) return '0 B';
@@ -193,12 +263,26 @@ function loadClusterConfig() {
 				'<span class="label label-danger">No</span>';
 			document.getElementById('cluster-node-name').textContent = data.node_name || '-';
 			document.getElementById('cluster-port').textContent = data.port || '-';
+			document.getElementById('cluster-auth-mode').innerHTML = data.auth_mode === 'oauth' ?
+				'<span class="label label-info">OAuth 2.0</span>' :
+				'<span class="label label-default">Token</span>';
 			document.getElementById('cluster-auto').innerHTML = data.auto_replicate ?
 				'<span class="label label-success">Yes</span>' :
 				'<span class="label label-default">No</span>';
 			document.getElementById('cluster-compression').textContent = (data.compression || 'none').toUpperCase();
 			document.getElementById('cluster-bandwidth').textContent = data.bandwidth_limit > 0 ?
 				formatBytes(data.bandwidth_limit * 1024) + '/s' : 'Unlimited';
+
+			// OAuth settings
+			document.getElementById('oauth-enabled').innerHTML = data.oauth_enabled ?
+				'<span class="label label-success">Yes</span>' :
+				'<span class="label label-default">No</span>';
+			document.getElementById('oauth-token-url').textContent = data.oauth_token_url || '-';
+			document.getElementById('oauth-client-id').textContent = data.oauth_client_id || '-';
+			document.getElementById('oauth-scopes').textContent = data.oauth_scopes || '-';
+
+			// Store for modal
+			window.clusterConfig = data;
 		})
 		.catch(err => console.error('Failed to load cluster config:', err));
 }
@@ -410,6 +494,83 @@ function escapeHtml(text) {
 	var div = document.createElement('div');
 	div.textContent = text;
 	return div.innerHTML;
+}
+
+function showOAuthModal() {
+	var modal = document.getElementById('oauth-modal');
+	modal.style.display = 'flex';
+
+	// Populate with current values
+	var config = window.clusterConfig || {};
+	document.getElementById('oauth-auth-mode').value = config.auth_mode || 'token';
+	document.getElementById('oauth-enabled-check').checked = config.oauth_enabled || false;
+	document.getElementById('oauth-token-url-input').value = config.oauth_token_url || '';
+	document.getElementById('oauth-client-id-input').value = config.oauth_client_id || '';
+	document.getElementById('oauth-client-secret-input').value = '';
+	document.getElementById('oauth-scopes-input').value = config.oauth_scopes || '';
+	document.getElementById('oauth-auth-token-input').value = '';
+
+	updateOAuthFieldsVisibility();
+}
+
+function hideOAuthModal() {
+	document.getElementById('oauth-modal').style.display = 'none';
+}
+
+function updateOAuthFieldsVisibility() {
+	var authMode = document.getElementById('oauth-auth-mode').value;
+	document.getElementById('oauth-fields').style.display = authMode === 'oauth' ? 'block' : 'none';
+	document.getElementById('token-fields').style.display = authMode === 'token' ? 'block' : 'none';
+}
+
+// Add event listener for auth mode change
+document.getElementById('oauth-auth-mode').addEventListener('change', updateOAuthFieldsVisibility);
+
+function saveOAuthSettings() {
+	var authMode = document.getElementById('oauth-auth-mode').value;
+	var payload = {
+		auth_mode: authMode
+	};
+
+	if (authMode === 'oauth') {
+		payload.oauth_enabled = document.getElementById('oauth-enabled-check').checked;
+		payload.oauth_token_url = document.getElementById('oauth-token-url-input').value.trim();
+		payload.oauth_client_id = document.getElementById('oauth-client-id-input').value.trim();
+		payload.oauth_scopes = document.getElementById('oauth-scopes-input').value.trim();
+
+		var secret = document.getElementById('oauth-client-secret-input').value;
+		if (secret) {
+			payload.oauth_client_secret = secret;
+		}
+
+		// Validation
+		if (payload.oauth_enabled && (!payload.oauth_token_url || !payload.oauth_client_id)) {
+			alert('Token URL and Client ID are required when OAuth is enabled');
+			return;
+		}
+	} else {
+		var token = document.getElementById('oauth-auth-token-input').value;
+		if (token) {
+			payload.auth_token = token;
+		}
+	}
+
+	fetch('/api/console/cluster/oauth', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(payload)
+	})
+		.then(response => response.json())
+		.then(data => {
+			if (data.status === 'success') {
+				hideOAuthModal();
+				loadClusterConfig();
+				alert('OAuth settings saved successfully');
+			} else {
+				alert('Failed to save settings: ' + (data.message || 'Unknown error'));
+			}
+		})
+		.catch(err => alert('Failed to save settings: ' + err));
 }
 
 // Initial load
