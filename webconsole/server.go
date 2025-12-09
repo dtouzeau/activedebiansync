@@ -59,6 +59,7 @@ type WebConsole struct {
 	usersDB        *database.UsersDB
 	eventsDB       *database.EventsDB
 	securityDB     *database.SecurityDB
+	clientsDB      *database.ClientsDB
 	server         *http.Server
 	httpServer     interface{}
 	syncer         interface{}
@@ -164,6 +165,16 @@ func (wc *WebConsole) SetSecurityDB(db *database.SecurityDB) {
 // GetSecurityDB returns the security database
 func (wc *WebConsole) GetSecurityDB() *database.SecurityDB {
 	return wc.securityDB
+}
+
+// SetClientsDB sets the clients database for tracking client statistics
+func (wc *WebConsole) SetClientsDB(db *database.ClientsDB) {
+	wc.clientsDB = db
+}
+
+// GetClientsDB returns the clients database
+func (wc *WebConsole) GetClientsDB() *database.ClientsDB {
+	return wc.clientsDB
 }
 
 // isTrustedProxy checks if the given IP is a trusted proxy
@@ -321,6 +332,7 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/logs", wc.requireAuth(wc.handleLogs))
 	mux.HandleFunc("/users", wc.requireAuth(wc.requireAdmin(wc.handleUsers)))
 	mux.HandleFunc("/security", wc.requireAuth(wc.requireAdmin(wc.handleSecurity)))
+	mux.HandleFunc("/clients", wc.requireAuth(wc.handleClients))
 	mux.HandleFunc("/cve", wc.requireAuth(wc.handleCVE))
 	mux.HandleFunc("/cve/find", wc.requireAuth(wc.handleCVEFind))
 	mux.HandleFunc("/sync/trigger", wc.requireAuth(wc.handleSyncTrigger))
@@ -361,6 +373,14 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/console/security/rules/delete", wc.requireAuth(wc.requireAdmin(wc.handleAPISecurityRuleDelete)))
 	mux.HandleFunc("/api/console/security/stats", wc.requireAuth(wc.handleAPISecurityStats))
 	mux.HandleFunc("/api/console/security/reload", wc.requireAuth(wc.requireAdmin(wc.handleAPISecurityReload)))
+
+	// Clients statistics API
+	mux.HandleFunc("/api/console/clients/stats", wc.requireAuth(wc.handleAPIClientsStats))
+	mux.HandleFunc("/api/console/clients/top", wc.requireAuth(wc.handleAPIClientsTop))
+	mux.HandleFunc("/api/console/clients/daily", wc.requireAuth(wc.handleAPIClientsDaily))
+	mux.HandleFunc("/api/console/clients/records", wc.requireAuth(wc.handleAPIClientsRecords))
+	mux.HandleFunc("/api/console/clients/history", wc.requireAuth(wc.handleAPIClientHistory))
+	mux.HandleFunc("/api/console/clients/cleanup", wc.requireAuth(wc.requireAdmin(wc.handleAPIClientsCleanup)))
 
 	addr := fmt.Sprintf("%s:%d", cfg.WebConsoleListenAddr, cfg.WebConsolePort)
 
@@ -721,6 +741,12 @@ func (wc *WebConsole) handleUsers(w http.ResponseWriter, r *http.Request) {
 func (wc *WebConsole) handleSecurity(w http.ResponseWriter, r *http.Request) {
 	session := wc.getSession(r)
 	wc.renderSecurity(w, r, session)
+}
+
+// handleClients handles the clients statistics page
+func (wc *WebConsole) handleClients(w http.ResponseWriter, r *http.Request) {
+	session := wc.getSession(r)
+	wc.renderClients(w, r, session)
 }
 
 // handleCVE handles the CVE dashboard page
@@ -2222,4 +2248,240 @@ func (wc *WebConsole) handleAPISecurityReload(w http.ResponseWriter, r *http.Req
 		"status":       "success",
 		"active_rules": wc.securityDB.GetCachedRuleCount(),
 	})
+}
+
+// handleAPIClientsStats returns global client statistics
+func (wc *WebConsole) handleAPIClientsStats(w http.ResponseWriter, r *http.Request) {
+	if wc.clientsDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Clients database not initialized",
+		})
+		return
+	}
+
+	stats, err := wc.clientsDB.GetGlobalStats()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+		"stats":  stats,
+	})
+}
+
+// handleAPIClientsTop returns top clients by bandwidth
+func (wc *WebConsole) handleAPIClientsTop(w http.ResponseWriter, r *http.Request) {
+	if wc.clientsDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Clients database not initialized",
+		})
+		return
+	}
+
+	// Parse query parameters
+	limit := 10
+	days := 30
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if val, err := parseIntParam(l); err == nil && val > 0 {
+			limit = val
+		}
+	}
+	if d := r.URL.Query().Get("days"); d != "" {
+		if val, err := parseIntParam(d); err == nil && val > 0 {
+			days = val
+		}
+	}
+
+	clients, err := wc.clientsDB.GetTopClients(limit, days)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"clients": clients,
+	})
+}
+
+// handleAPIClientsDaily returns daily summary statistics
+func (wc *WebConsole) handleAPIClientsDaily(w http.ResponseWriter, r *http.Request) {
+	if wc.clientsDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Clients database not initialized",
+		})
+		return
+	}
+
+	days := 30
+	if d := r.URL.Query().Get("days"); d != "" {
+		if val, err := parseIntParam(d); err == nil && val > 0 {
+			days = val
+		}
+	}
+
+	summary, err := wc.clientsDB.GetDailySummary(days)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"summary": summary,
+	})
+}
+
+// handleAPIClientsRecords returns recent client access records
+func (wc *WebConsole) handleAPIClientsRecords(w http.ResponseWriter, r *http.Request) {
+	if wc.clientsDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Clients database not initialized",
+		})
+		return
+	}
+
+	limit := 100
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if val, err := parseIntParam(l); err == nil && val > 0 {
+			limit = val
+		}
+	}
+
+	records, err := wc.clientsDB.GetRecentRecords(limit)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"records": records,
+	})
+}
+
+// handleAPIClientHistory returns access history for a specific client IP
+func (wc *WebConsole) handleAPIClientHistory(w http.ResponseWriter, r *http.Request) {
+	if wc.clientsDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Clients database not initialized",
+		})
+		return
+	}
+
+	ip := r.URL.Query().Get("ip")
+	if ip == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "IP address required",
+		})
+		return
+	}
+
+	limit := 100
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if val, err := parseIntParam(l); err == nil && val > 0 {
+			limit = val
+		}
+	}
+
+	records, err := wc.clientsDB.GetClientHistory(ip, limit)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"ip":      ip,
+		"records": records,
+	})
+}
+
+// handleAPIClientsCleanup manually triggers cleanup of old records
+func (wc *WebConsole) handleAPIClientsCleanup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.clientsDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Clients database not initialized",
+		})
+		return
+	}
+
+	days := 30
+	if d := r.URL.Query().Get("days"); d != "" {
+		if val, err := parseIntParam(d); err == nil && val > 0 {
+			days = val
+		}
+	}
+
+	deleted, err := wc.clientsDB.CleanupOldRecords(days)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	wc.logger.LogInfo("Client records cleanup: %d records deleted (older than %d days)", deleted, days)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"deleted": deleted,
+		"days":    days,
+	})
+}
+
+// parseIntParam safely parses an integer from a string
+func parseIntParam(s string) (int, error) {
+	var val int
+	_, err := fmt.Sscanf(s, "%d", &val)
+	return val, err
 }

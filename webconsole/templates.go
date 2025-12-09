@@ -140,6 +140,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
 				<li class="%s"><a href="/dashboard"><i class="material-icons">dashboard</i> Dashboard</a></li>
 				<li class="%s"><a href="/packages"><i class="material-icons">folder</i> Packages</a></li>
 				<li class="%s"><a href="/search"><i class="material-icons">search</i> Package Search</a></li>
+				<li class="%s"><a href="/clients"><i class="material-icons">devices</i> Clients</a></li>
 				<li class="%s"><a href="/events"><i class="material-icons">event_note</i> Events</a></li>
 				<li class="%s"><a href="/logs"><i class="material-icons">article</i> Logs</a></li>
 				<li class="%s"><a href="/settings"><i class="material-icons">settings</i> Settings</a></li>
@@ -203,6 +204,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
 		activeClass(page, "dashboard"),
 		activeClass(page, "packages"),
 		activeClass(page, "search"),
+		activeClass(page, "clients"),
 		activeClass(page, "events"),
 		activeClass(page, "logs"),
 		activeClass(page, "settings"),
@@ -2542,6 +2544,338 @@ loadStats();
 `
 
 	html := wc.baseTemplate("Access Control", "security", content, session)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(html))
+}
+
+// renderClients renders the clients statistics page
+func (wc *WebConsole) renderClients(w http.ResponseWriter, r *http.Request, session *database.Session) {
+	content := `
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:25px">
+	<h1 style="margin:0;font-size:1.8em;font-weight:400">Client Statistics</h1>
+	<div>
+		<select id="days-filter" class="form-control" style="display:inline-block;width:auto;margin-right:10px" onchange="loadAllData()">
+			<option value="7">Last 7 days</option>
+			<option value="14">Last 14 days</option>
+			<option value="30" selected>Last 30 days</option>
+		</select>
+		<button class="btn btn-secondary" onclick="loadAllData()">
+			<i class="material-icons" style="font-size:16px">refresh</i> Refresh
+		</button>
+	</div>
+</div>
+
+<div class="stats-row">
+	<div class="stat-card primary">
+		<p>Unique Clients</p>
+		<h2 id="stat-clients">-</h2>
+	</div>
+	<div class="stat-card success">
+		<p>Total Files</p>
+		<h2 id="stat-files">-</h2>
+	</div>
+	<div class="stat-card info">
+		<p>Total Bandwidth</p>
+		<h2 id="stat-bytes">-</h2>
+	</div>
+	<div class="stat-card warning">
+		<p>Total Requests</p>
+		<h2 id="stat-requests">-</h2>
+	</div>
+</div>
+
+<ul class="nav nav-tabs" style="margin-bottom:20px;border-bottom:1px solid #ddd">
+	<li style="display:inline-block;margin-right:5px"><a href="#" class="tab-link active" data-tab="top-clients" style="padding:10px 15px;display:block;text-decoration:none;border:1px solid transparent;border-bottom:none;border-radius:4px 4px 0 0">Top Clients</a></li>
+	<li style="display:inline-block;margin-right:5px"><a href="#" class="tab-link" data-tab="daily-stats" style="padding:10px 15px;display:block;text-decoration:none;border:1px solid transparent;border-bottom:none;border-radius:4px 4px 0 0">Daily Summary</a></li>
+	<li style="display:inline-block;margin-right:5px"><a href="#" class="tab-link" data-tab="recent-records" style="padding:10px 15px;display:block;text-decoration:none;border:1px solid transparent;border-bottom:none;border-radius:4px 4px 0 0">Recent Activity</a></li>
+	<li style="display:inline-block"><a href="#" class="tab-link" data-tab="client-history" style="padding:10px 15px;display:block;text-decoration:none;border:1px solid transparent;border-bottom:none;border-radius:4px 4px 0 0">Client History</a></li>
+</ul>
+
+<style>
+.tab-link { color: #666; background: #f5f5f5; }
+.tab-link:hover { background: #e0e0e0; color: #333; }
+.tab-link.active { background: #fff; color: #1976d2; border-color: #ddd !important; margin-bottom: -1px; }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+</style>
+
+<div id="tab-top-clients" class="tab-content active">
+	<div class="card">
+		<div class="card-header">Top Clients by Bandwidth</div>
+		<div class="card-body" style="padding:0">
+			<table class="table table-striped" id="top-clients-table">
+				<thead>
+					<tr>
+						<th>IP Address</th>
+						<th>User-Agent</th>
+						<th>Files</th>
+						<th>Bandwidth</th>
+						<th>Requests</th>
+						<th>First Seen</th>
+						<th>Last Seen</th>
+						<th>Actions</th>
+					</tr>
+				</thead>
+				<tbody id="top-clients-body">
+				</tbody>
+			</table>
+		</div>
+	</div>
+</div>
+
+<div id="tab-daily-stats" class="tab-content">
+	<div class="card">
+		<div class="card-header">Daily Summary</div>
+		<div class="card-body" style="padding:0">
+			<table class="table table-striped" id="daily-stats-table">
+				<thead>
+					<tr>
+						<th>Date</th>
+						<th>Unique Clients</th>
+						<th>Files Downloaded</th>
+						<th>Bandwidth</th>
+						<th>Total Requests</th>
+					</tr>
+				</thead>
+				<tbody id="daily-stats-body">
+				</tbody>
+			</table>
+		</div>
+	</div>
+</div>
+
+<div id="tab-recent-records" class="tab-content">
+	<div class="card">
+		<div class="card-header">Recent Activity (Last 100 Records)</div>
+		<div class="card-body" style="padding:0">
+			<table class="table table-striped" id="recent-records-table">
+				<thead>
+					<tr>
+						<th>Date/Time</th>
+						<th>IP Address</th>
+						<th>User-Agent</th>
+						<th>Files</th>
+						<th>Bytes</th>
+					</tr>
+				</thead>
+				<tbody id="recent-records-body">
+				</tbody>
+			</table>
+		</div>
+	</div>
+</div>
+
+<div id="tab-client-history" class="tab-content">
+	<div class="card">
+		<div class="card-header">
+			<div style="display:flex;align-items:center;gap:15px">
+				<span>Client History</span>
+				<input type="text" id="client-ip-input" class="form-control" style="width:200px" placeholder="Enter IP address">
+				<button class="btn btn-primary btn-sm" onclick="loadClientHistory()">
+					<i class="material-icons" style="font-size:16px">search</i> Search
+				</button>
+			</div>
+		</div>
+		<div class="card-body" style="padding:0">
+			<table class="table table-striped" id="client-history-table">
+				<thead>
+					<tr>
+						<th>Date/Time</th>
+						<th>User-Agent</th>
+						<th>Files</th>
+						<th>Bytes</th>
+					</tr>
+				</thead>
+				<tbody id="client-history-body">
+					<tr><td colspan="4" style="text-align:center;color:#666;padding:30px">Enter an IP address to view history</td></tr>
+				</tbody>
+			</table>
+		</div>
+	</div>
+</div>
+
+<script>
+function formatBytes(bytes) {
+	if (bytes === 0) return '0 B';
+	var k = 1024;
+	var sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+	var i = Math.floor(Math.log(bytes) / Math.log(k));
+	return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function formatNumber(num) {
+	return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function formatDate(dateStr) {
+	if (!dateStr) return '-';
+	var d = new Date(dateStr);
+	return d.toLocaleString();
+}
+
+function escapeHtml(text) {
+	if (!text) return '';
+	var div = document.createElement('div');
+	div.textContent = text;
+	return div.innerHTML;
+}
+
+function getDays() {
+	return document.getElementById('days-filter').value;
+}
+
+function loadStats() {
+	fetch('/api/console/clients/stats')
+		.then(response => response.json())
+		.then(data => {
+			if (data.status === 'success' && data.stats) {
+				document.getElementById('stat-clients').textContent = formatNumber(data.stats.total_clients);
+				document.getElementById('stat-files').textContent = formatNumber(data.stats.total_files);
+				document.getElementById('stat-bytes').textContent = formatBytes(data.stats.total_bytes);
+				document.getElementById('stat-requests').textContent = formatNumber(data.stats.total_requests);
+			}
+		});
+}
+
+function loadTopClients() {
+	var days = getDays();
+	fetch('/api/console/clients/top?limit=20&days=' + days)
+		.then(response => response.json())
+		.then(data => {
+			var tbody = document.getElementById('top-clients-body');
+			tbody.innerHTML = '';
+			if (data.status === 'success' && data.clients && data.clients.length > 0) {
+				data.clients.forEach(function(client) {
+					var row = document.createElement('tr');
+					var ua = client.user_agent || '';
+					var uaShort = ua.length > 40 ? ua.substring(0, 40) + '...' : ua;
+					row.innerHTML = '<td><strong>' + escapeHtml(client.ip_addr) + '</strong></td>' +
+						'<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escapeHtml(ua) + '">' + escapeHtml(uaShort) + '</td>' +
+						'<td>' + formatNumber(client.total_files) + '</td>' +
+						'<td>' + formatBytes(client.total_bytes) + '</td>' +
+						'<td>' + formatNumber(client.request_count) + '</td>' +
+						'<td>' + formatDate(client.first_seen) + '</td>' +
+						'<td>' + formatDate(client.last_seen) + '</td>' +
+						'<td><button class="btn btn-xs btn-info" onclick="viewClientHistory(\'' + escapeHtml(client.ip_addr) + '\')" title="View History"><i class="material-icons">history</i></button></td>';
+					tbody.appendChild(row);
+				});
+			} else {
+				tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#666;padding:30px">No client data available</td></tr>';
+			}
+		});
+}
+
+function loadDailyStats() {
+	var days = getDays();
+	fetch('/api/console/clients/daily?days=' + days)
+		.then(response => response.json())
+		.then(data => {
+			var tbody = document.getElementById('daily-stats-body');
+			tbody.innerHTML = '';
+			if (data.status === 'success' && data.summary && data.summary.length > 0) {
+				data.summary.forEach(function(day) {
+					var row = document.createElement('tr');
+					row.innerHTML = '<td><strong>' + day.date + '</strong></td>' +
+						'<td>' + formatNumber(day.unique_clients) + '</td>' +
+						'<td>' + formatNumber(day.total_files) + '</td>' +
+						'<td>' + formatBytes(day.total_bytes) + '</td>' +
+						'<td>' + formatNumber(day.total_requests) + '</td>';
+					tbody.appendChild(row);
+				});
+			} else {
+				tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#666;padding:30px">No daily data available</td></tr>';
+			}
+		});
+}
+
+function loadRecentRecords() {
+	fetch('/api/console/clients/records?limit=100')
+		.then(response => response.json())
+		.then(data => {
+			var tbody = document.getElementById('recent-records-body');
+			tbody.innerHTML = '';
+			if (data.status === 'success' && data.records && data.records.length > 0) {
+				data.records.forEach(function(record) {
+					var row = document.createElement('tr');
+					var ua = record.user_agent || '';
+					var uaShort = ua.length > 50 ? ua.substring(0, 50) + '...' : ua;
+					row.innerHTML = '<td>' + formatDate(record.date) + '</td>' +
+						'<td>' + escapeHtml(record.ip_addr) + '</td>' +
+						'<td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escapeHtml(ua) + '">' + escapeHtml(uaShort) + '</td>' +
+						'<td>' + formatNumber(record.files_num) + '</td>' +
+						'<td>' + formatBytes(record.bytes_num) + '</td>';
+					tbody.appendChild(row);
+				});
+			} else {
+				tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#666;padding:30px">No recent records</td></tr>';
+			}
+		});
+}
+
+function loadClientHistory() {
+	var ip = document.getElementById('client-ip-input').value.trim();
+	if (!ip) {
+		alert('Please enter an IP address');
+		return;
+	}
+
+	fetch('/api/console/clients/history?ip=' + encodeURIComponent(ip) + '&limit=100')
+		.then(response => response.json())
+		.then(data => {
+			var tbody = document.getElementById('client-history-body');
+			tbody.innerHTML = '';
+			if (data.status === 'success' && data.records && data.records.length > 0) {
+				data.records.forEach(function(record) {
+					var row = document.createElement('tr');
+					var ua = record.user_agent || '';
+					var uaShort = ua.length > 60 ? ua.substring(0, 60) + '...' : ua;
+					row.innerHTML = '<td>' + formatDate(record.date) + '</td>' +
+						'<td style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escapeHtml(ua) + '">' + escapeHtml(uaShort) + '</td>' +
+						'<td>' + formatNumber(record.files_num) + '</td>' +
+						'<td>' + formatBytes(record.bytes_num) + '</td>';
+					tbody.appendChild(row);
+				});
+			} else {
+				tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#666;padding:30px">No history found for ' + escapeHtml(ip) + '</td></tr>';
+			}
+		});
+}
+
+function viewClientHistory(ip) {
+	document.getElementById('client-ip-input').value = ip;
+	// Switch to client history tab
+	document.querySelectorAll('.tab-link').forEach(function(t) { t.classList.remove('active'); });
+	document.querySelectorAll('.tab-content').forEach(function(c) { c.classList.remove('active'); });
+	document.querySelector('[data-tab="client-history"]').classList.add('active');
+	document.getElementById('tab-client-history').classList.add('active');
+	loadClientHistory();
+}
+
+function loadAllData() {
+	loadStats();
+	loadTopClients();
+	loadDailyStats();
+	loadRecentRecords();
+}
+
+// Tab switching
+document.querySelectorAll('.tab-link').forEach(function(tab) {
+	tab.addEventListener('click', function(e) {
+		e.preventDefault();
+		var tabId = this.getAttribute('data-tab');
+		document.querySelectorAll('.tab-link').forEach(function(t) { t.classList.remove('active'); });
+		document.querySelectorAll('.tab-content').forEach(function(c) { c.classList.remove('active'); });
+		this.classList.add('active');
+		document.getElementById('tab-' + tabId).classList.add('active');
+	});
+});
+
+// Initial load
+loadAllData();
+</script>
+`
+
+	html := wc.baseTemplate("Client Statistics", "clients", content, session)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(html))
 }

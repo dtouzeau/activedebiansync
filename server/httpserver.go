@@ -34,6 +34,7 @@ type HTTPServer struct {
 	syncChecker SyncChecker
 	analytics   *stats.Analytics
 	securityDB  *database.SecurityDB
+	clientsDB   *database.ClientsDB
 	wg          sync.WaitGroup
 }
 
@@ -134,6 +135,16 @@ func (s *HTTPServer) SetSecurityDB(securityDB *database.SecurityDB) {
 // GetSecurityDB retourne la base de données de sécurité
 func (s *HTTPServer) GetSecurityDB() *database.SecurityDB {
 	return s.securityDB
+}
+
+// SetClientsDB définit la base de données des clients pour les statistiques
+func (s *HTTPServer) SetClientsDB(clientsDB *database.ClientsDB) {
+	s.clientsDB = clientsDB
+}
+
+// GetClientsDB retourne la base de données des clients
+func (s *HTTPServer) GetClientsDB() *database.ClientsDB {
+	return s.clientsDB
 }
 
 // Start démarre les serveurs HTTP/HTTPS
@@ -306,6 +317,14 @@ func (s *HTTPServer) createLoggingHandlerWithHTTPS(next http.Handler, isHTTPS bo
 
 		// Suivre le client
 		s.clients.Track(clientIP, wrapped.bytesWritten)
+
+		// Enregistrer dans la base de données clients si disponible et si c'est une requête réussie
+		if s.clientsDB != nil && wrapped.statusCode == http.StatusOK && wrapped.bytesWritten > 0 {
+			// Enregistrer l'accès (1 fichier par requête réussie)
+			go func(ip, ua string, bytes int64) {
+				s.clientsDB.RecordAccess(ip, ua, 1, bytes)
+			}(clientIP, userAgent, wrapped.bytesWritten)
+		}
 
 		// Enregistrer l'accès dans les analytics si disponible et si c'est une requête réussie
 		if s.analytics != nil && wrapped.statusCode == http.StatusOK && wrapped.bytesWritten > 0 {
