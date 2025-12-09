@@ -1336,6 +1336,19 @@ func (wc *WebConsole) handleAPIConfigUpdate(w http.ResponseWriter, r *http.Reque
 		if v, ok := params["artica_repository_ssl"].(bool); ok {
 			cfg.ArticaRepositorySSL = v
 		}
+		// Translation settings
+		if v, ok := params["sync_translations"].(bool); ok {
+			cfg.SyncTranslations = v
+		}
+		if v, ok := params["translation_languages"].([]interface{}); ok {
+			langs := make([]string, 0, len(v))
+			for _, l := range v {
+				if ls, ok := l.(string); ok && ls != "" {
+					langs = append(langs, ls)
+				}
+			}
+			cfg.TranslationLanguages = langs
+		}
 	})
 
 	// Save config to file
