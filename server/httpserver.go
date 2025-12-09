@@ -2,10 +2,12 @@ package server
 
 import (
 	"activedebiansync/config"
+	"activedebiansync/database"
 	"activedebiansync/stats"
 	"activedebiansync/utils"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -31,14 +33,15 @@ type HTTPServer struct {
 	clients     *ClientTracker
 	syncChecker SyncChecker
 	analytics   *stats.Analytics
+	securityDB  *database.SecurityDB
 	wg          sync.WaitGroup
 }
 
 // ServerStats contient les statistiques du serveur HTTP
 type ServerStats struct {
-	TotalRequests   int64 `json:"total_requests"`
-	TotalBytesSent  int64 `json:"total_bytes_sent"`
-	ActiveClients   int32 `json:"active_clients"`
+	TotalRequests  int64 `json:"total_requests"`
+	TotalBytesSent int64 `json:"total_bytes_sent"`
+	ActiveClients  int32 `json:"active_clients"`
 }
 
 // ClientInfo contient les informations sur un client connecté
@@ -123,18 +126,31 @@ func (s *HTTPServer) SetAnalytics(analytics *stats.Analytics) {
 	s.analytics = analytics
 }
 
+// SetSecurityDB définit la base de données de sécurité pour le contrôle d'accès
+func (s *HTTPServer) SetSecurityDB(securityDB *database.SecurityDB) {
+	s.securityDB = securityDB
+}
+
+// GetSecurityDB retourne la base de données de sécurité
+func (s *HTTPServer) GetSecurityDB() *database.SecurityDB {
+	return s.securityDB
+}
+
 // Start démarre les serveurs HTTP/HTTPS
 func (s *HTTPServer) Start(ctx context.Context) error {
 	cfg := s.config.Get()
 
-	// Créer le handler avec logging
-	handler := s.createLoggingHandler(http.FileServer(http.Dir(cfg.RepositoryPath)))
+	// Créer le file server de base
+	fileServer := http.FileServer(http.Dir(cfg.RepositoryPath))
+
+	// Créer le handler HTTP avec logging (isHTTPS = false)
+	httpHandler := s.createLoggingHandler(fileServer)
 
 	// Démarrer le serveur HTTP
 	if cfg.HTTPEnabled {
 		s.httpServer = &http.Server{
 			Addr:    fmt.Sprintf(":%d", cfg.HTTPPort),
-			Handler: handler,
+			Handler: httpHandler,
 		}
 
 		s.wg.Add(1)
@@ -155,9 +171,12 @@ func (s *HTTPServer) Start(ctx context.Context) error {
 		} else if _, err := os.Stat(cfg.TLSKeyFile); os.IsNotExist(err) {
 			s.logger.LogError("TLS key not found: %s", cfg.TLSKeyFile)
 		} else {
+			// Créer le handler HTTPS avec logging (isHTTPS = true)
+			httpsHandler := s.createLoggingHandlerHTTPS(fileServer)
+
 			s.httpsServer = &http.Server{
 				Addr:    fmt.Sprintf(":%d", cfg.HTTPSPort),
-				Handler: handler,
+				Handler: httpsHandler,
 			}
 
 			s.wg.Add(1)
@@ -201,15 +220,52 @@ func (s *HTTPServer) Stop() error {
 
 // createLoggingHandler crée un handler qui log les accès
 func (s *HTTPServer) createLoggingHandler(next http.Handler) http.Handler {
+	return s.createLoggingHandlerWithHTTPS(next, false)
+}
+
+// createLoggingHandlerHTTPS crée un handler pour HTTPS
+func (s *HTTPServer) createLoggingHandlerHTTPS(next http.Handler) http.Handler {
+	return s.createLoggingHandlerWithHTTPS(next, true)
+}
+
+// createLoggingHandlerWithHTTPS crée un handler qui log les accès avec support HTTPS
+func (s *HTTPServer) createLoggingHandlerWithHTTPS(next http.Handler, isHTTPS bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := s.config.Get()
 
+		// Extraire l'IP du client
+		clientIP := r.RemoteAddr
+		if host, _, err := net.SplitHostPort(clientIP); err == nil {
+			clientIP = host
+		}
+
+		// Vérifier X-Forwarded-For pour les proxies
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			// Prendre la première IP (client original)
+			parts := strings.Split(xff, ",")
+			if len(parts) > 0 {
+				clientIP = strings.TrimSpace(parts[0])
+			}
+		}
+
+		userAgent := r.Header.Get("User-Agent")
+
+		// Vérifier les règles de sécurité
+		var bandwidthLimit int64
+		if s.securityDB != nil {
+			result := s.securityDB.CheckAccess(clientIP, userAgent, isHTTPS)
+			if result.Denied {
+				s.logger.LogAccess(clientIP, r.Method, r.RequestURI, http.StatusForbidden, 0)
+				s.logger.LogInfo("Access denied for %s (UA: %s): %s", clientIP, userAgent, result.Reason)
+				w.WriteHeader(http.StatusForbidden)
+				w.Write([]byte("403 Forbidden - Access denied by security policy\n"))
+				return
+			}
+			bandwidthLimit = result.BandwidthLimit
+		}
+
 		// Bloquer les clients si une synchronisation est en cours
 		if cfg.BlockClientsDuringSync && s.syncChecker != nil && s.syncChecker.IsRunning() {
-			clientIP := r.RemoteAddr
-			if host, _, err := net.SplitHostPort(clientIP); err == nil {
-				clientIP = host
-			}
 			s.logger.LogAccess(clientIP, r.Method, r.RequestURI, http.StatusServiceUnavailable, 0)
 			w.WriteHeader(http.StatusServiceUnavailable)
 			w.Write([]byte("503 Service Unavailable - Repository synchronization in progress\n"))
@@ -223,21 +279,20 @@ func (s *HTTPServer) createLoggingHandler(next http.Handler) http.Handler {
 		defer atomic.AddInt32(&s.stats.ActiveClients, -1)
 
 		// Wrapper pour capturer le status code et les bytes envoyés
-		wrapped := &responseWriter{ResponseWriter: w, statusCode: 200}
+		// Si bandwidth limit, utiliser le rate limited writer
+		var wrapped *responseWriter
+		if bandwidthLimit > 0 {
+			wrapped = &responseWriter{
+				ResponseWriter: w,
+				statusCode:     200,
+				rateLimiter:    newRateLimiter(bandwidthLimit),
+			}
+		} else {
+			wrapped = &responseWriter{ResponseWriter: w, statusCode: 200}
+		}
 
 		// Appeler le handler suivant
 		next.ServeHTTP(wrapped, r)
-
-		// Extraire l'IP du client
-		clientIP := r.RemoteAddr
-		if host, _, err := net.SplitHostPort(clientIP); err == nil {
-			clientIP = host
-		}
-
-		// Vérifier X-Forwarded-For pour les proxies
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			clientIP = xff
-		}
 
 		// Calculer la durée
 		duration := time.Since(start)
@@ -348,6 +403,7 @@ type responseWriter struct {
 	http.ResponseWriter
 	statusCode   int
 	bytesWritten int64
+	rateLimiter  *rateLimiter
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
@@ -356,7 +412,86 @@ func (rw *responseWriter) WriteHeader(code int) {
 }
 
 func (rw *responseWriter) Write(b []byte) (int, error) {
+	// Apply rate limiting if configured
+	if rw.rateLimiter != nil {
+		return rw.rateLimiter.Write(rw.ResponseWriter, b, &rw.bytesWritten)
+	}
+
 	n, err := rw.ResponseWriter.Write(b)
 	rw.bytesWritten += int64(n)
 	return n, err
+}
+
+// rateLimiter implements bandwidth limiting
+type rateLimiter struct {
+	bytesPerSecond int64
+	lastTime       time.Time
+	bytesSent      int64
+	mu             sync.Mutex
+}
+
+// newRateLimiter creates a new rate limiter with the specified bytes per second
+func newRateLimiter(bytesPerSecond int64) *rateLimiter {
+	return &rateLimiter{
+		bytesPerSecond: bytesPerSecond,
+		lastTime:       time.Now(),
+	}
+}
+
+// Write writes data with rate limiting
+func (rl *rateLimiter) Write(w io.Writer, b []byte, totalWritten *int64) (int, error) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	totalBytes := len(b)
+	written := 0
+
+	// Write in chunks to apply rate limiting
+	chunkSize := int(rl.bytesPerSecond / 10) // 100ms chunks
+	if chunkSize < 1024 {
+		chunkSize = 1024 // Minimum 1KB chunks
+	}
+	if chunkSize > totalBytes {
+		chunkSize = totalBytes
+	}
+
+	for written < totalBytes {
+		// Calculate how many bytes we can send
+		now := time.Now()
+		elapsed := now.Sub(rl.lastTime)
+
+		// Calculate allowed bytes based on elapsed time
+		allowedBytes := int64(elapsed.Seconds() * float64(rl.bytesPerSecond))
+
+		// If we've sent too much, sleep
+		if rl.bytesSent >= allowedBytes && elapsed < time.Second {
+			sleepTime := time.Duration(float64(rl.bytesSent-allowedBytes) / float64(rl.bytesPerSecond) * float64(time.Second))
+			if sleepTime > 0 {
+				time.Sleep(sleepTime)
+			}
+		}
+
+		// Reset counter every second
+		if elapsed >= time.Second {
+			rl.lastTime = now
+			rl.bytesSent = 0
+		}
+
+		// Write chunk
+		end := written + chunkSize
+		if end > totalBytes {
+			end = totalBytes
+		}
+
+		n, err := w.Write(b[written:end])
+		written += n
+		rl.bytesSent += int64(n)
+		*totalWritten += int64(n)
+
+		if err != nil {
+			return written, err
+		}
+	}
+
+	return written, nil
 }
