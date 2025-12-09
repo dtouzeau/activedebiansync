@@ -72,6 +72,7 @@ func NewClientsDB(configPath string) (*ClientsDB, error) {
 	}
 
 	if err := clientsDB.initSchema(); err != nil {
+
 		db.Close()
 		return nil, err
 	}

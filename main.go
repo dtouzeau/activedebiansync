@@ -138,6 +138,22 @@ func startDaemon() {
 	httpServer := server.NewHTTPServer(cfg, logger)
 	httpServer.SetSyncChecker(syncer)
 	httpServer.SetAnalytics(syncer.GetAnalytics())
+
+	// Initialize security database
+	securityDB, err := database.NewSecurityDB(*configPath)
+	if err != nil {
+		logger.LogError("Failed to initialize security database: %v", err)
+		logger.LogError("Security rules will be disabled")
+	} else {
+		httpServer.SetSecurityDB(securityDB)
+		logger.LogInfo("Security database initialized with %d active rules", securityDB.GetCachedRuleCount())
+		defer func() {
+			if err := securityDB.Close(); err != nil {
+				logger.LogError("Failed to close security database: %v", err)
+			}
+		}()
+	}
+
 	pkgManager := pkgmanager.NewPackageManager(cfg, logger, gpgManager)
 	syncer.SetPackageIndexer(pkgManager) // Enable Artica packages to be added to repository
 	restAPI := api.NewRestAPI(cfg, logger, syncer, httpServer, pkgManager, gpgManager, syncer)
@@ -177,6 +193,43 @@ func startDaemon() {
 				}
 			}()
 		}
+	}
+
+	// Initialize events database
+	eventsDB, err := database.NewEventsDB(*configPath)
+	if err != nil {
+		logger.LogError("Failed to initialize events database: %v", err)
+		logger.LogError("Sync event tracking will be disabled")
+	} else {
+		syncer.SetEventsDB(eventsDB)
+		logger.LogInfo("Events database initialized")
+		defer func() {
+			if err := eventsDB.Close(); err != nil {
+				logger.LogError("Failed to close events database: %v", err)
+			}
+		}()
+	}
+
+	// Initialize clients database for tracking client access statistics
+	clientsDB, err := database.NewClientsDB(*configPath)
+	if err != nil {
+		logger.LogError("Failed to initialize clients database: %v", err)
+		logger.LogError("Client statistics tracking will be disabled")
+	} else {
+		httpServer.SetClientsDB(clientsDB)
+		// Cleanup old records (older than 30 days)
+		deleted, err := clientsDB.CleanupOldRecords(30)
+		if err != nil {
+			logger.LogError("Failed to cleanup old client records: %v", err)
+		} else if deleted > 0 {
+			logger.LogInfo("Cleaned up %d old client records", deleted)
+		}
+		logger.LogInfo("Clients database initialized")
+		defer func() {
+			if err := clientsDB.Close(); err != nil {
+				logger.LogError("Failed to close clients database: %v", err)
+			}
+		}()
 	}
 
 	// Initialiser le scanner CVE
@@ -309,6 +362,15 @@ func startDaemon() {
 			// Set providers for the web console
 			webConsole.SetProviders(httpServer, syncer, pkgManager)
 			webConsole.SetCVEScanner(cveAdapter)
+			if eventsDB != nil {
+				webConsole.SetEventsDB(eventsDB)
+			}
+			if securityDB != nil {
+				webConsole.SetSecurityDB(securityDB)
+			}
+			if clientsDB != nil {
+				webConsole.SetClientsDB(clientsDB)
+			}
 
 			go func() {
 				if err := webConsole.Start(ctx); err != nil {
