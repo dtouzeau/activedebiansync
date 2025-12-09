@@ -10,6 +10,8 @@
   "sync_installer_udebs": false,
   "sync_installer_images": false,
   "installer_image_types": ["netboot", "hd-media", "cdrom"],
+  "sync_translations": true,
+  "translation_languages": ["en", "fr", "de", "es"],
   "max_concurrent_downloads": 8,
   "download_bandwidth_limit": 5000,
   "block_clients_during_sync": true,

@@ -6,6 +6,8 @@
   "debian_releases": ["bookworm"],
   "debian_architectures": ["amd64"],
   "debian_components": ["main", "contrib", "non-free", "non-free-firmware"],
+  "sync_translations": true,
+  "translation_languages": ["en", "fr", "de", "es"],
   "http_enabled": true,
   "http_port": 8080,
   "https_enabled": false,
