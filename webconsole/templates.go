@@ -428,8 +428,22 @@ function formatBytes(bytes) {
 	return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
-function formatDuration(ns) {
-	var seconds = ns / 1e9;
+function formatDuration(duration) {
+	// Handle string duration format like "3m41.223237365s" or "2h30m0s"
+	if (typeof duration === 'string') {
+		var hours = 0, minutes = 0, seconds = 0;
+		var hMatch = duration.match(/(\d+)h/);
+		var mMatch = duration.match(/(\d+)m/);
+		var sMatch = duration.match(/([\d.]+)s/);
+		if (hMatch) hours = parseInt(hMatch[1]);
+		if (mMatch) minutes = parseInt(mMatch[1]);
+		if (sMatch) seconds = Math.round(parseFloat(sMatch[1]));
+		if (hours > 0) return hours + 'h ' + minutes + 'm';
+		if (minutes > 0) return minutes + 'm ' + seconds + 's';
+		return seconds + 's';
+	}
+	// Handle numeric nanoseconds
+	var seconds = duration / 1e9;
 	if (seconds < 60) return Math.round(seconds) + 's';
 	var minutes = Math.floor(seconds / 60);
 	seconds = Math.round(seconds %% 60);
