@@ -58,6 +58,7 @@ type WebConsole struct {
 	logger         *utils.Logger
 	usersDB        *database.UsersDB
 	eventsDB       *database.EventsDB
+	securityDB     *database.SecurityDB
 	server         *http.Server
 	httpServer     interface{}
 	syncer         interface{}
@@ -153,6 +154,16 @@ func (wc *WebConsole) SetEventsDB(db *database.EventsDB) {
 // GetEventsDB returns the events database
 func (wc *WebConsole) GetEventsDB() *database.EventsDB {
 	return wc.eventsDB
+}
+
+// SetSecurityDB sets the security database for access control rules
+func (wc *WebConsole) SetSecurityDB(db *database.SecurityDB) {
+	wc.securityDB = db
+}
+
+// GetSecurityDB returns the security database
+func (wc *WebConsole) GetSecurityDB() *database.SecurityDB {
+	return wc.securityDB
 }
 
 // isTrustedProxy checks if the given IP is a trusted proxy
@@ -309,6 +320,7 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/search", wc.requireAuth(wc.handleSearch))
 	mux.HandleFunc("/logs", wc.requireAuth(wc.handleLogs))
 	mux.HandleFunc("/users", wc.requireAuth(wc.requireAdmin(wc.handleUsers)))
+	mux.HandleFunc("/security", wc.requireAuth(wc.requireAdmin(wc.handleSecurity)))
 	mux.HandleFunc("/cve", wc.requireAuth(wc.handleCVE))
 	mux.HandleFunc("/cve/find", wc.requireAuth(wc.handleCVEFind))
 	mux.HandleFunc("/sync/trigger", wc.requireAuth(wc.handleSyncTrigger))
@@ -341,6 +353,14 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/console/cve/vulnerable", wc.requireAuth(wc.handleAPICVEVulnerable))
 	mux.HandleFunc("/api/console/cve/package", wc.requireAuth(wc.handleAPICVEPackage))
 	mux.HandleFunc("/api/console/cve/search", wc.requireAuth(wc.handleAPICVESearch))
+
+	// Security rules API (admin only)
+	mux.HandleFunc("/api/console/security/rules", wc.requireAuth(wc.requireAdmin(wc.handleAPISecurityRules)))
+	mux.HandleFunc("/api/console/security/rules/create", wc.requireAuth(wc.requireAdmin(wc.handleAPISecurityRuleCreate)))
+	mux.HandleFunc("/api/console/security/rules/update", wc.requireAuth(wc.requireAdmin(wc.handleAPISecurityRuleUpdate)))
+	mux.HandleFunc("/api/console/security/rules/delete", wc.requireAuth(wc.requireAdmin(wc.handleAPISecurityRuleDelete)))
+	mux.HandleFunc("/api/console/security/stats", wc.requireAuth(wc.handleAPISecurityStats))
+	mux.HandleFunc("/api/console/security/reload", wc.requireAuth(wc.requireAdmin(wc.handleAPISecurityReload)))
 
 	addr := fmt.Sprintf("%s:%d", cfg.WebConsoleListenAddr, cfg.WebConsolePort)
 
@@ -695,6 +715,12 @@ func (wc *WebConsole) handleLogs(w http.ResponseWriter, r *http.Request) {
 func (wc *WebConsole) handleUsers(w http.ResponseWriter, r *http.Request) {
 	session := wc.getSession(r)
 	wc.renderUsers(w, r, session)
+}
+
+// handleSecurity handles the security rules management page
+func (wc *WebConsole) handleSecurity(w http.ResponseWriter, r *http.Request) {
+	session := wc.getSession(r)
+	wc.renderSecurity(w, r, session)
 }
 
 // handleCVE handles the CVE dashboard page
@@ -1935,4 +1961,265 @@ func parseInt(s string) (int, error) {
 	var n int
 	_, err := fmt.Sscanf(s, "%d", &n)
 	return n, err
+}
+
+// handleAPISecurityRules returns all security rules
+func (wc *WebConsole) handleAPISecurityRules(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.securityDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"rules": []interface{}{},
+			"error": "Security database not initialized",
+		})
+		return
+	}
+
+	rules, err := wc.securityDB.GetAllRules()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"rules": []interface{}{},
+			"error": err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"rules": rules,
+		"count": len(rules),
+	})
+}
+
+// handleAPISecurityRuleCreate creates a new security rule
+func (wc *WebConsole) handleAPISecurityRuleCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.securityDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Security database not initialized",
+		})
+		return
+	}
+
+	var rule database.SecurityRule
+	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Invalid JSON: " + err.Error(),
+		})
+		return
+	}
+
+	if err := wc.securityDB.CreateRule(&rule); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	wc.logger.LogInfo("Security rule created: %s (type: %s)", rule.Name, rule.Type)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+		"rule":   rule,
+	})
+}
+
+// handleAPISecurityRuleUpdate updates an existing security rule
+func (wc *WebConsole) handleAPISecurityRuleUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.securityDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Security database not initialized",
+		})
+		return
+	}
+
+	var rule database.SecurityRule
+	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Invalid JSON: " + err.Error(),
+		})
+		return
+	}
+
+	if rule.ID == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Rule ID is required",
+		})
+		return
+	}
+
+	if err := wc.securityDB.UpdateRule(&rule); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	wc.logger.LogInfo("Security rule updated: %s (ID: %d)", rule.Name, rule.ID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+		"rule":   rule,
+	})
+}
+
+// handleAPISecurityRuleDelete deletes a security rule
+func (wc *WebConsole) handleAPISecurityRuleDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.securityDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Security database not initialized",
+		})
+		return
+	}
+
+	// Get ID from query param or body
+	var ruleID int64
+	idStr := r.URL.Query().Get("id")
+	if idStr != "" {
+		id, err := parseInt(idStr)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": "error",
+				"error":  "Invalid rule ID",
+			})
+			return
+		}
+		ruleID = int64(id)
+	} else {
+		var body struct {
+			ID int64 `json:"id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			ruleID = body.ID
+		}
+	}
+
+	if ruleID == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Rule ID is required",
+		})
+		return
+	}
+
+	if err := wc.securityDB.DeleteRule(ruleID); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	wc.logger.LogInfo("Security rule deleted: ID %d", ruleID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+	})
+}
+
+// handleAPISecurityStats returns security statistics
+func (wc *WebConsole) handleAPISecurityStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.securityDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"stats": map[string]interface{}{},
+			"error": "Security database not initialized",
+		})
+		return
+	}
+
+	stats, err := wc.securityDB.GetStats()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"stats": map[string]interface{}{},
+			"error": err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"stats": stats,
+	})
+}
+
+// handleAPISecurityReload reloads the security rules from database
+func (wc *WebConsole) handleAPISecurityReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.securityDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  "Security database not initialized",
+		})
+		return
+	}
+
+	if err := wc.securityDB.ReloadRules(); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	wc.logger.LogInfo("Security rules reloaded: %d active rules", wc.securityDB.GetCachedRuleCount())
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":       "success",
+		"active_rules": wc.securityDB.GetCachedRuleCount(),
+	})
 }

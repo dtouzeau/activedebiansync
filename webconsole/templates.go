@@ -235,7 +235,8 @@ func adminMenu(isAdmin bool, page string) string {
 	return fmt.Sprintf(`
 				<li class="nav-heading">Administration</li>
 				<li class="%s"><a href="/users"><i class="material-icons">people</i> Users</a></li>
-	`, activeClass(page, "users"))
+				<li class="%s"><a href="/security"><i class="material-icons">shield</i> Access Control</a></li>
+	`, activeClass(page, "users"), activeClass(page, "security"))
 }
 
 // renderLogin renders the login page
@@ -2209,6 +2210,338 @@ autoRefreshInterval = setInterval(loadLogs, 5000);
 `
 
 	html := wc.baseTemplate("Daemon Logs", "logs", content, session)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(html))
+}
+
+// renderSecurity renders the security rules management page (admin only)
+func (wc *WebConsole) renderSecurity(w http.ResponseWriter, r *http.Request, session *database.Session) {
+	content := `
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:25px">
+	<h1 style="margin:0;font-size:1.8em;font-weight:400">Access Control</h1>
+	<button class="btn btn-primary" onclick="showCreateModal()">
+		<i class="material-icons">add</i> Add Rule
+	</button>
+</div>
+
+<div class="alert alert-info" style="margin-bottom:20px">
+	<i class="material-icons" style="vertical-align:middle">info</i>
+	<strong>Note:</strong> If no rules are defined, all access is allowed by default. Rules are evaluated in priority order (highest first).
+	HTTPS connections and HTTP connections can be controlled separately.
+</div>
+
+<div style="display:grid;grid-template-columns:2fr 1fr;gap:20px">
+	<div class="card">
+		<div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
+			<span>Security Rules</span>
+			<button class="btn btn-secondary btn-sm" onclick="reloadRules()">
+				<i class="material-icons" style="font-size:16px">refresh</i> Reload
+			</button>
+		</div>
+		<div class="card-body" style="padding:0">
+			<table class="table table-striped" id="rules-table">
+				<thead>
+					<tr>
+						<th style="width:40px">Pri</th>
+						<th>Name</th>
+						<th>Type</th>
+						<th>IP/CIDR</th>
+						<th>User-Agent</th>
+						<th>Bandwidth</th>
+						<th>HTTP</th>
+						<th>HTTPS</th>
+						<th style="width:60px">Active</th>
+						<th style="width:100px">Actions</th>
+					</tr>
+				</thead>
+				<tbody id="rules-body">
+				</tbody>
+			</table>
+		</div>
+	</div>
+	<div>
+		<div class="card" id="rule-form-card">
+			<div class="card-header" id="rule-form-header">Create Rule</div>
+			<div class="card-body">
+				<form id="rule-form">
+					<input type="hidden" id="rule-id">
+					<div class="form-group">
+						<label>Name</label>
+						<input type="text" class="form-control" id="rule-name" required placeholder="e.g., Block bad bots">
+					</div>
+					<div class="form-group">
+						<label>Type</label>
+						<select class="form-control" id="rule-type" onchange="toggleBandwidthField()">
+							<option value="allow">Allow</option>
+							<option value="deny">Deny</option>
+							<option value="limit">Limit (Bandwidth)</option>
+						</select>
+					</div>
+					<div class="form-group">
+						<label>Priority (higher = first)</label>
+						<input type="number" class="form-control" id="rule-priority" value="100" min="1" max="10000">
+					</div>
+					<div class="form-group">
+						<label>IP Address or CIDR (optional)</label>
+						<input type="text" class="form-control" id="rule-ip" placeholder="e.g., 192.168.1.0/24 or 10.0.0.5">
+					</div>
+					<div class="form-group">
+						<label>User-Agent Match (regex, optional)</label>
+						<input type="text" class="form-control" id="rule-ua" placeholder="e.g., .*curl.* or BadBot">
+					</div>
+					<div class="form-group" id="bandwidth-group" style="display:none">
+						<label>Bandwidth Limit (bytes/sec)</label>
+						<input type="number" class="form-control" id="rule-bandwidth" value="0" min="0">
+						<small style="color:#666">e.g., 1048576 = 1 MB/s, 524288 = 512 KB/s</small>
+					</div>
+					<div class="form-group">
+						<label style="display:flex;align-items:center;gap:8px">
+							<input type="checkbox" id="rule-http" checked> Apply to HTTP
+						</label>
+					</div>
+					<div class="form-group">
+						<label style="display:flex;align-items:center;gap:8px">
+							<input type="checkbox" id="rule-https" checked> Apply to HTTPS
+						</label>
+					</div>
+					<div class="form-group">
+						<label style="display:flex;align-items:center;gap:8px">
+							<input type="checkbox" id="rule-enabled" checked> Enabled
+						</label>
+					</div>
+					<div class="form-group">
+						<label>Description (optional)</label>
+						<textarea class="form-control" id="rule-description" rows="2" placeholder="Optional description"></textarea>
+					</div>
+					<div style="display:flex;gap:10px">
+						<button type="submit" class="btn btn-primary" id="rule-submit-btn">Create Rule</button>
+						<button type="button" class="btn" style="background:#e0e0e0" onclick="resetForm()">Cancel</button>
+					</div>
+				</form>
+			</div>
+		</div>
+		<div class="card" style="margin-top:20px">
+			<div class="card-header">Statistics</div>
+			<div class="card-body">
+				<table class="table">
+					<tr><td><strong>Total Rules</strong></td><td id="stat-total">-</td></tr>
+					<tr><td><strong>Active Rules</strong></td><td id="stat-active">-</td></tr>
+					<tr><td><strong>Deny Rules</strong></td><td id="stat-deny">-</td></tr>
+					<tr><td><strong>Allow Rules</strong></td><td id="stat-allow">-</td></tr>
+					<tr><td><strong>Limit Rules</strong></td><td id="stat-limit">-</td></tr>
+				</table>
+			</div>
+		</div>
+	</div>
+</div>
+
+<script>
+var editingRuleId = null;
+
+function toggleBandwidthField() {
+	var type = document.getElementById('rule-type').value;
+	document.getElementById('bandwidth-group').style.display = (type === 'limit') ? 'block' : 'none';
+}
+
+function formatBytes(bytes) {
+	if (bytes === 0) return 'Unlimited';
+	if (bytes < 1024) return bytes + ' B/s';
+	if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB/s';
+	return (bytes / 1048576).toFixed(1) + ' MB/s';
+}
+
+function loadRules() {
+	fetch('/api/console/security/rules')
+		.then(response => response.json())
+		.then(data => {
+			var tbody = document.getElementById('rules-body');
+			tbody.innerHTML = '';
+			if (data.rules && data.rules.length > 0) {
+				data.rules.forEach(function(rule) {
+					var typeLabel = 'label-default';
+					if (rule.type === 'allow') typeLabel = 'label-success';
+					else if (rule.type === 'deny') typeLabel = 'label-danger';
+					else if (rule.type === 'limit') typeLabel = 'label-primary';
+
+					var row = document.createElement('tr');
+					row.innerHTML = '<td>' + rule.priority + '</td>' +
+						'<td>' + escapeHtml(rule.name) + '</td>' +
+						'<td><span class="label ' + typeLabel + '">' + rule.type + '</span></td>' +
+						'<td>' + (rule.ip_address || '<em style="color:#999">any</em>') + '</td>' +
+						'<td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escapeHtml(rule.user_agent_match || '') + '">' + (rule.user_agent_match ? escapeHtml(rule.user_agent_match) : '<em style="color:#999">any</em>') + '</td>' +
+						'<td>' + (rule.type === 'limit' ? formatBytes(rule.bandwidth_limit) : '-') + '</td>' +
+						'<td>' + (rule.apply_to_http ? '<span class="label label-success">Yes</span>' : '<span class="label label-default">No</span>') + '</td>' +
+						'<td>' + (rule.apply_to_https ? '<span class="label label-success">Yes</span>' : '<span class="label label-default">No</span>') + '</td>' +
+						'<td>' + (rule.enabled ? '<span class="label label-success">Yes</span>' : '<span class="label label-danger">No</span>') + '</td>' +
+						'<td><div class="btn-group-actions">' +
+						'<button class="btn btn-xs btn-info" onclick="editRule(' + rule.id + ')" title="Edit"><i class="material-icons">edit</i></button>' +
+						'<button class="btn btn-xs btn-danger" onclick="deleteRule(' + rule.id + ', \'' + escapeHtml(rule.name) + '\')" title="Delete"><i class="material-icons">delete</i></button>' +
+						'</div></td>';
+					tbody.appendChild(row);
+				});
+			} else {
+				tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#666;padding:30px">No security rules defined. All access is allowed.</td></tr>';
+			}
+		});
+}
+
+function loadStats() {
+	fetch('/api/console/security/stats')
+		.then(response => response.json())
+		.then(data => {
+			document.getElementById('stat-total').textContent = data.total || 0;
+			document.getElementById('stat-active').textContent = data.active || 0;
+			document.getElementById('stat-deny').textContent = data.deny || 0;
+			document.getElementById('stat-allow').textContent = data.allow || 0;
+			document.getElementById('stat-limit').textContent = data.limit || 0;
+		});
+}
+
+function resetForm() {
+	editingRuleId = null;
+	document.getElementById('rule-id').value = '';
+	document.getElementById('rule-name').value = '';
+	document.getElementById('rule-type').value = 'allow';
+	document.getElementById('rule-priority').value = '100';
+	document.getElementById('rule-ip').value = '';
+	document.getElementById('rule-ua').value = '';
+	document.getElementById('rule-bandwidth').value = '0';
+	document.getElementById('rule-http').checked = true;
+	document.getElementById('rule-https').checked = true;
+	document.getElementById('rule-enabled').checked = true;
+	document.getElementById('rule-description').value = '';
+	document.getElementById('rule-form-header').textContent = 'Create Rule';
+	document.getElementById('rule-submit-btn').textContent = 'Create Rule';
+	toggleBandwidthField();
+}
+
+function showCreateModal() {
+	resetForm();
+}
+
+function editRule(id) {
+	fetch('/api/console/security/rules')
+		.then(response => response.json())
+		.then(data => {
+			var rule = data.rules.find(r => r.id === id);
+			if (rule) {
+				editingRuleId = id;
+				document.getElementById('rule-id').value = id;
+				document.getElementById('rule-name').value = rule.name;
+				document.getElementById('rule-type').value = rule.type;
+				document.getElementById('rule-priority').value = rule.priority;
+				document.getElementById('rule-ip').value = rule.ip_address || '';
+				document.getElementById('rule-ua').value = rule.user_agent_match || '';
+				document.getElementById('rule-bandwidth').value = rule.bandwidth_limit || 0;
+				document.getElementById('rule-http').checked = rule.apply_to_http;
+				document.getElementById('rule-https').checked = rule.apply_to_https;
+				document.getElementById('rule-enabled').checked = rule.enabled;
+				document.getElementById('rule-description').value = rule.description || '';
+				document.getElementById('rule-form-header').textContent = 'Edit Rule';
+				document.getElementById('rule-submit-btn').textContent = 'Update Rule';
+				toggleBandwidthField();
+			}
+		});
+}
+
+function deleteRule(id, name) {
+	if (confirm('Are you sure you want to delete rule "' + name + '"?')) {
+		fetch('/api/console/security/rules/delete', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ id: id })
+		})
+		.then(response => response.json())
+		.then(result => {
+			if (result.status === 'success') {
+				loadRules();
+				loadStats();
+			} else {
+				alert('Failed to delete rule: ' + (result.message || 'Unknown error'));
+			}
+		});
+	}
+}
+
+function reloadRules() {
+	fetch('/api/console/security/reload', { method: 'POST' })
+		.then(response => response.json())
+		.then(result => {
+			if (result.status === 'success') {
+				loadRules();
+				loadStats();
+				alert('Security rules reloaded successfully');
+			} else {
+				alert('Failed to reload rules: ' + (result.message || 'Unknown error'));
+			}
+		});
+}
+
+function escapeHtml(text) {
+	var div = document.createElement('div');
+	div.textContent = text;
+	return div.innerHTML;
+}
+
+document.getElementById('rule-form').addEventListener('submit', function(e) {
+	e.preventDefault();
+
+	var data = {
+		name: document.getElementById('rule-name').value,
+		type: document.getElementById('rule-type').value,
+		priority: parseInt(document.getElementById('rule-priority').value),
+		ip_address: document.getElementById('rule-ip').value,
+		user_agent_match: document.getElementById('rule-ua').value,
+		bandwidth_limit: parseInt(document.getElementById('rule-bandwidth').value) || 0,
+		apply_to_http: document.getElementById('rule-http').checked,
+		apply_to_https: document.getElementById('rule-https').checked,
+		enabled: document.getElementById('rule-enabled').checked,
+		description: document.getElementById('rule-description').value
+	};
+
+	if (editingRuleId) {
+		data.id = parseInt(document.getElementById('rule-id').value);
+		fetch('/api/console/security/rules/update', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(data)
+		})
+		.then(response => response.json())
+		.then(result => {
+			if (result.status === 'success') {
+				resetForm();
+				loadRules();
+				loadStats();
+			} else {
+				alert('Failed to update rule: ' + (result.message || 'Unknown error'));
+			}
+		});
+	} else {
+		fetch('/api/console/security/rules/create', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(data)
+		})
+		.then(response => response.json())
+		.then(result => {
+			if (result.status === 'success') {
+				resetForm();
+				loadRules();
+				loadStats();
+			} else {
+				alert('Failed to create rule: ' + (result.message || 'Unknown error'));
+			}
+		});
+	}
+});
+
+// Initial load
+loadRules();
+loadStats();
+</script>
+`
+
+	html := wc.baseTemplate("Access Control", "security", content, session)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(html))
 }
