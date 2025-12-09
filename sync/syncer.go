@@ -43,6 +43,11 @@ type CVEScannerInterface interface {
 	Scan(release, component, architecture string, includePackages bool) (interface{}, error)
 }
 
+// ReplicationManagerInterface defines the interface for cluster replication
+type ReplicationManagerInterface interface {
+	ReplicateToPeers() error
+}
+
 // Syncer gère la synchronisation des dépôts Debian
 type Syncer struct {
 	config         *config.Config
@@ -50,6 +55,7 @@ type Syncer struct {
 	gpgManager     GPGSigner
 	packageIndexer PackageIndexer
 	cveScanner     CVEScannerInterface
+	replicationMgr ReplicationManagerInterface
 	mirrorManager  *mirrors.MirrorManager
 	httpClient     *http.Client
 	validator      *integrity.Validator
@@ -446,6 +452,18 @@ func (s *Syncer) doSync(force bool) error {
 				s.logger.LogError("CVE scan after sync failed: %v", err)
 			} else {
 				s.logger.LogInfo("CVE scan after sync completed")
+			}
+		}()
+	}
+
+	// Trigger cluster replication after sync if enabled
+	if s.replicationMgr != nil && cfg.ClusterEnabled && cfg.ClusterAutoReplicate {
+		s.logger.LogInfo("Starting cluster replication after sync...")
+		go func() {
+			if err := s.replicationMgr.ReplicateToPeers(); err != nil {
+				s.logger.LogError("Cluster replication after sync failed: %v", err)
+			} else {
+				s.logger.LogInfo("Cluster replication after sync completed")
 			}
 		}()
 	}
@@ -1356,6 +1374,11 @@ func (s *Syncer) SetPackageIndexer(indexer PackageIndexer) {
 // SetCVEScanner sets the CVE scanner for the syncer
 func (s *Syncer) SetCVEScanner(scanner CVEScannerInterface) {
 	s.cveScanner = scanner
+}
+
+// SetReplicationManager sets the replication manager for cluster sync
+func (s *Syncer) SetReplicationManager(rm ReplicationManagerInterface) {
+	s.replicationMgr = rm
 }
 
 // CheckForUpdates vérifie si de nouvelles mises à jour sont disponibles

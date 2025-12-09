@@ -75,5 +75,24 @@
       "sync_security": true,
       "sync_proposed": false
     }
-  ]
+  ],
+  "cluster_enabled": false,
+  "cluster_node_name": "node1",
+  "cluster_port": 9191,
+  "cluster_auth_token": "your-secret-token",
+  "cluster_peers": [
+    {
+      "name": "node2",
+      "address": "192.168.1.102:9191",
+      "enabled": true
+    },
+    {
+      "name": "node3",
+      "address": "192.168.1.103:9191",
+      "enabled": true
+    }
+  ],
+  "cluster_auto_replicate": true,
+  "cluster_compression": "zstd",
+  "cluster_bandwidth_limit": 0
 }

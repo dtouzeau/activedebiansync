@@ -166,6 +166,16 @@ type Config struct {
 	WebConsoleTrustedProxies   string `json:"web_console_trusted_proxies"`     // Comma-separated list of trusted proxy IPs/CIDRs
 	WebConsoleSecureCookies    bool   `json:"web_console_secure_cookies"`      // Force secure cookies (for HTTPS reverse proxy)
 
+	// Cluster Replication Settings
+	ClusterEnabled        bool          `json:"cluster_enabled"`         // Enable cluster replication
+	ClusterNodeName       string        `json:"cluster_node_name"`       // Unique node identifier
+	ClusterPort           int           `json:"cluster_port"`            // TCP port for replication (default: 9191)
+	ClusterAuthToken      string        `json:"cluster_auth_token"`      // Shared secret for authentication
+	ClusterPeers          []ClusterPeer `json:"cluster_peers"`           // List of peer nodes
+	ClusterAutoReplicate  bool          `json:"cluster_auto_replicate"`  // Trigger replication after sync
+	ClusterCompression    string        `json:"cluster_compression"`     // "zstd", "gzip", "none"
+	ClusterBandwidthLimit int           `json:"cluster_bandwidth_limit"` // KB/s limit (0 = unlimited)
+
 	mu sync.RWMutex
 }
 
@@ -174,6 +184,13 @@ type MirrorConfig struct {
 	URL      string `json:"url"`      // URL du miroir
 	Priority int    `json:"priority"` // Priorité (plus bas = plus prioritaire)
 	Enabled  bool   `json:"enabled"`  // Activé ou non
+}
+
+// ClusterPeer represents a peer node in the cluster
+type ClusterPeer struct {
+	Name    string `json:"name"`    // Friendly name for the peer
+	Address string `json:"address"` // hostname:port (e.g., "192.168.1.100:9191")
+	Enabled bool   `json:"enabled"` // Whether to replicate to this peer
 }
 
 // DefaultConfig retourne une configuration par défaut
@@ -268,6 +285,16 @@ func DefaultConfig() *Config {
 		WebConsoleBasePath:         "",    // Empty = no base path
 		WebConsoleTrustedProxies:   "",    // Empty = trust localhost only
 		WebConsoleSecureCookies:    false, // Set to true when behind HTTPS proxy
+
+		// Cluster Replication
+		ClusterEnabled:        false, // Disabled by default
+		ClusterNodeName:       "",    // Generated on first run if empty
+		ClusterPort:           9191,  // Default replication port
+		ClusterAuthToken:      "",    // Generated on first run if empty
+		ClusterPeers:          []ClusterPeer{},
+		ClusterAutoReplicate:  true,   // Auto-replicate after sync
+		ClusterCompression:    "zstd", // Best compression/speed ratio
+		ClusterBandwidthLimit: 0,      // Unlimited
 	}
 }
 

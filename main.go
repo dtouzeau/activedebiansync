@@ -2,6 +2,7 @@ package main
 
 import (
 	"activedebiansync/api"
+	"activedebiansync/cluster"
 	"activedebiansync/config"
 	"activedebiansync/cvescanner"
 	"activedebiansync/database"
@@ -232,6 +233,27 @@ func startDaemon() {
 		}()
 	}
 
+	// Initialize cluster replication (if enabled)
+	var clusterDB *database.ClusterDB
+	var replicationMgr *cluster.ReplicationManager
+	if cfgData.ClusterEnabled {
+		var err error
+		clusterDB, err = database.NewClusterDB(*configPath)
+		if err != nil {
+			logger.LogError("Failed to initialize cluster database: %v", err)
+			logger.LogError("Cluster replication will be disabled")
+		} else {
+			replicationMgr = cluster.NewReplicationManager(cfg, logger, clusterDB)
+			syncer.SetReplicationManager(replicationMgr)
+			logger.LogInfo("Cluster replication initialized (node: %s, port: %d)", cfgData.ClusterNodeName, cfgData.ClusterPort)
+			defer func() {
+				if err := clusterDB.Close(); err != nil {
+					logger.LogError("Failed to close cluster database: %v", err)
+				}
+			}()
+		}
+	}
+
 	// Initialiser le scanner CVE
 	cveScanner := cvescanner.NewCVEScanner(cfg, logger)
 	cveAdapter := cvescanner.NewCVEScannerAdapter(cveScanner)
@@ -371,6 +393,12 @@ func startDaemon() {
 			if clientsDB != nil {
 				webConsole.SetClientsDB(clientsDB)
 			}
+			if clusterDB != nil {
+				webConsole.SetClusterDB(clusterDB)
+			}
+			if replicationMgr != nil {
+				webConsole.SetReplicationManager(replicationMgr)
+			}
 
 			go func() {
 				if err := webConsole.Start(ctx); err != nil {
@@ -380,11 +408,22 @@ func startDaemon() {
 		}
 	}
 
+	// Start cluster replication server (if enabled)
+	if replicationMgr != nil {
+		go func() {
+			if err := replicationMgr.Start(ctx); err != nil {
+				logger.LogError("Failed to start cluster replication server: %v", err)
+			}
+		}()
+		defer replicationMgr.Stop()
+	}
+
 	logger.LogInfo("All services started successfully")
 	logger.LogInfo("HTTP Server: %v (port %d)", cfgData.HTTPEnabled, cfgData.HTTPPort)
 	logger.LogInfo("HTTPS Server: %v (port %d)", cfgData.HTTPSEnabled, cfgData.HTTPSPort)
 	logger.LogInfo("REST API: %v (%s:%d)", cfgData.APIEnabled, cfgData.APIListenAddr, cfgData.APIPort)
 	logger.LogInfo("Web Console: %v (%s:%d)", cfgData.WebConsoleEnabled, cfgData.WebConsoleListenAddr, cfgData.WebConsolePort)
+	logger.LogInfo("Cluster: %v (port %d)", cfgData.ClusterEnabled, cfgData.ClusterPort)
 	logger.LogInfo("Repository Path: %s", cfgData.RepositoryPath)
 	logger.LogInfo("Sync Interval: %d minutes", cfgData.SyncInterval)
 

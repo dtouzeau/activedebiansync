@@ -50,6 +50,14 @@ type CVEScannerProvider interface {
 	IsEnabled() bool
 }
 
+// ReplicationManagerProvider interface for cluster replication
+type ReplicationManagerProvider interface {
+	GetStatus() interface{}
+	ReplicateToPeers() error
+	ManualReplicate(peerName string) error
+	PullFromPeer(peerName string) error
+}
+
 // WebConsole manages the web console server
 type WebConsole struct {
 	config         *config.Config
@@ -60,11 +68,13 @@ type WebConsole struct {
 	eventsDB       *database.EventsDB
 	securityDB     *database.SecurityDB
 	clientsDB      *database.ClientsDB
+	clusterDB      *database.ClusterDB
 	server         *http.Server
 	httpServer     interface{}
 	syncer         interface{}
 	pkgManager     interface{}
 	cveScanner     CVEScannerProvider
+	replicationMgr ReplicationManagerProvider
 	templates      *template.Template
 	sessionSecret  string
 	basePath       string
@@ -175,6 +185,16 @@ func (wc *WebConsole) SetClientsDB(db *database.ClientsDB) {
 // GetClientsDB returns the clients database
 func (wc *WebConsole) GetClientsDB() *database.ClientsDB {
 	return wc.clientsDB
+}
+
+// SetClusterDB sets the cluster database for replication statistics
+func (wc *WebConsole) SetClusterDB(db *database.ClusterDB) {
+	wc.clusterDB = db
+}
+
+// SetReplicationManager sets the replication manager
+func (wc *WebConsole) SetReplicationManager(rm ReplicationManagerProvider) {
+	wc.replicationMgr = rm
 }
 
 // isTrustedProxy checks if the given IP is a trusted proxy
@@ -381,6 +401,18 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/console/clients/records", wc.requireAuth(wc.handleAPIClientsRecords))
 	mux.HandleFunc("/api/console/clients/history", wc.requireAuth(wc.handleAPIClientHistory))
 	mux.HandleFunc("/api/console/clients/cleanup", wc.requireAuth(wc.requireAdmin(wc.handleAPIClientsCleanup)))
+
+	// Cluster replication page
+	mux.HandleFunc("/cluster", wc.requireAuth(wc.handleCluster))
+
+	// Cluster replication API
+	mux.HandleFunc("/api/console/cluster/status", wc.requireAuth(wc.handleAPIClusterStatus))
+	mux.HandleFunc("/api/console/cluster/stats", wc.requireAuth(wc.handleAPIClusterStats))
+	mux.HandleFunc("/api/console/cluster/nodes", wc.requireAuth(wc.handleAPIClusterNodes))
+	mux.HandleFunc("/api/console/cluster/nodes/add", wc.requireAuth(wc.requireAdmin(wc.handleAPIClusterNodeAdd)))
+	mux.HandleFunc("/api/console/cluster/nodes/remove", wc.requireAuth(wc.requireAdmin(wc.handleAPIClusterNodeRemove)))
+	mux.HandleFunc("/api/console/cluster/replicate", wc.requireAuth(wc.handleAPIClusterReplicate))
+	mux.HandleFunc("/api/console/cluster/history", wc.requireAuth(wc.handleAPIClusterHistory))
 
 	addr := fmt.Sprintf("%s:%d", cfg.WebConsoleListenAddr, cfg.WebConsolePort)
 
@@ -2499,4 +2531,303 @@ func parseIntParam(s string) (int, error) {
 	var val int
 	_, err := fmt.Sscanf(s, "%d", &val)
 	return val, err
+}
+
+// handleCluster renders the cluster replication page
+func (wc *WebConsole) handleCluster(w http.ResponseWriter, r *http.Request) {
+	session := wc.getSession(r)
+	wc.renderCluster(w, r, session)
+}
+
+// handleAPIClusterStatus returns cluster status and configuration
+func (wc *WebConsole) handleAPIClusterStatus(w http.ResponseWriter, r *http.Request) {
+	cfg := wc.config.Get()
+
+	response := map[string]interface{}{
+		"enabled":         cfg.ClusterEnabled,
+		"node_name":       cfg.ClusterNodeName,
+		"port":            cfg.ClusterPort,
+		"auto_replicate":  cfg.ClusterAutoReplicate,
+		"compression":     cfg.ClusterCompression,
+		"bandwidth_limit": cfg.ClusterBandwidthLimit,
+		"peers_count":     len(cfg.ClusterPeers),
+	}
+
+	// Include replication status if available
+	if wc.replicationMgr != nil {
+		response["replication"] = wc.replicationMgr.GetStatus()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleAPIClusterStats returns cluster statistics
+func (wc *WebConsole) handleAPIClusterStats(w http.ResponseWriter, r *http.Request) {
+	if wc.clusterDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"total_nodes":         0,
+			"online_nodes":        0,
+			"total_replications":  0,
+			"total_bytes_synced":  0,
+			"total_files_synced":  0,
+			"active_replications": 0,
+		})
+		return
+	}
+
+	stats, err := wc.clusterDB.GetClusterStats()
+	if err != nil {
+		wc.logger.LogError("Failed to get cluster stats: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
+// handleAPIClusterNodes returns all cluster nodes
+func (wc *WebConsole) handleAPIClusterNodes(w http.ResponseWriter, r *http.Request) {
+	if wc.clusterDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"nodes": []interface{}{}})
+		return
+	}
+
+	nodes, err := wc.clusterDB.GetAllNodes()
+	if err != nil {
+		wc.logger.LogError("Failed to get cluster nodes: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"nodes": nodes})
+}
+
+// handleAPIClusterNodeAdd adds a new peer node
+func (wc *WebConsole) handleAPIClusterNodeAdd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Name    string `json:"name"`
+		Address string `json:"address"`
+		Enabled bool   `json:"enabled"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Invalid request body",
+		})
+		return
+	}
+
+	if req.Name == "" || req.Address == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Name and address are required",
+		})
+		return
+	}
+
+	// Parse address to extract host and port
+	cfg := wc.config.Get()
+	host := req.Address
+	port := cfg.ClusterPort
+
+	if strings.Contains(req.Address, ":") {
+		parts := strings.SplitN(req.Address, ":", 2)
+		host = parts[0]
+		fmt.Sscanf(parts[1], "%d", &port)
+	}
+
+	// Add to config
+	newPeer := config.ClusterPeer{
+		Name:    req.Name,
+		Address: req.Address,
+		Enabled: req.Enabled,
+	}
+
+	wc.config.Update(func(c *config.Config) {
+		// Check for duplicate
+		for i, p := range c.ClusterPeers {
+			if p.Name == req.Name {
+				// Update existing
+				c.ClusterPeers[i] = newPeer
+				return
+			}
+		}
+		// Add new
+		c.ClusterPeers = append(c.ClusterPeers, newPeer)
+	})
+
+	// Save config
+	if err := wc.config.Save(wc.configPath); err != nil {
+		wc.logger.LogError("Failed to save config: %v", err)
+	}
+
+	// Add to database
+	if wc.clusterDB != nil {
+		node := database.ClusterNode{
+			Name:    req.Name,
+			Address: host,
+			Port:    port,
+			Enabled: req.Enabled,
+			Status:  "unknown",
+		}
+		if err := wc.clusterDB.UpsertNode(node); err != nil {
+			wc.logger.LogError("Failed to add node to database: %v", err)
+		}
+	}
+
+	wc.logger.LogInfo("Added cluster peer: %s (%s)", req.Name, req.Address)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"message": "Peer added successfully",
+	})
+}
+
+// handleAPIClusterNodeRemove removes a peer node
+func (wc *WebConsole) handleAPIClusterNodeRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Invalid request body",
+		})
+		return
+	}
+
+	if req.Name == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Name is required",
+		})
+		return
+	}
+
+	// Remove from config
+	wc.config.Update(func(c *config.Config) {
+		for i, p := range c.ClusterPeers {
+			if p.Name == req.Name {
+				c.ClusterPeers = append(c.ClusterPeers[:i], c.ClusterPeers[i+1:]...)
+				break
+			}
+		}
+	})
+
+	// Save config
+	if err := wc.config.Save(wc.configPath); err != nil {
+		wc.logger.LogError("Failed to save config: %v", err)
+	}
+
+	// Remove from database
+	if wc.clusterDB != nil {
+		if err := wc.clusterDB.DeleteNode(req.Name); err != nil {
+			wc.logger.LogError("Failed to remove node from database: %v", err)
+		}
+	}
+
+	wc.logger.LogInfo("Removed cluster peer: %s", req.Name)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"message": "Peer removed successfully",
+	})
+}
+
+// handleAPIClusterReplicate triggers replication
+func (wc *WebConsole) handleAPIClusterReplicate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.replicationMgr == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Replication manager not available",
+		})
+		return
+	}
+
+	var req struct {
+		Peer      string `json:"peer"`
+		Direction string `json:"direction"` // "push" or "pull"
+	}
+
+	json.NewDecoder(r.Body).Decode(&req)
+
+	go func() {
+		var err error
+		if req.Peer != "" {
+			// Replicate to specific peer
+			if req.Direction == "pull" {
+				err = wc.replicationMgr.PullFromPeer(req.Peer)
+			} else {
+				err = wc.replicationMgr.ManualReplicate(req.Peer)
+			}
+		} else {
+			// Replicate to all peers
+			err = wc.replicationMgr.ReplicateToPeers()
+		}
+		if err != nil {
+			wc.logger.LogError("Replication failed: %v", err)
+		}
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"message": "Replication started",
+	})
+}
+
+// handleAPIClusterHistory returns replication history
+func (wc *WebConsole) handleAPIClusterHistory(w http.ResponseWriter, r *http.Request) {
+	if wc.clusterDB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"events": []interface{}{}})
+		return
+	}
+
+	limit := 50
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		fmt.Sscanf(limitStr, "%d", &limit)
+	}
+
+	events, err := wc.clusterDB.GetRecentEvents(limit)
+	if err != nil {
+		wc.logger.LogError("Failed to get replication events: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"events": events})
 }

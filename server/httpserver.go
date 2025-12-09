@@ -318,7 +318,6 @@ func (s *HTTPServer) createLoggingHandlerWithHTTPS(next http.Handler, isHTTPS bo
 		// Suivre le client
 		s.clients.Track(clientIP, wrapped.bytesWritten)
 
-		// Enregistrer dans la base de données clients si disponible et si c'est une requête réussie
 		if s.clientsDB != nil && wrapped.statusCode == http.StatusOK && wrapped.bytesWritten > 0 {
 			// Enregistrer l'accès (1 fichier par requête réussie)
 			go func(ip, ua string, bytes int64) {
@@ -326,7 +325,6 @@ func (s *HTTPServer) createLoggingHandlerWithHTTPS(next http.Handler, isHTTPS bo
 			}(clientIP, userAgent, wrapped.bytesWritten)
 		}
 
-		// Enregistrer l'accès dans les analytics si disponible et si c'est une requête réussie
 		if s.analytics != nil && wrapped.statusCode == http.StatusOK && wrapped.bytesWritten > 0 {
 			// Extraire le nom du package depuis le chemin (pour les fichiers .deb)
 			packageName := s.extractPackageName(r.URL.Path)

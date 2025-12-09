@@ -146,6 +146,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
 				<li class="%s"><a href="/settings"><i class="material-icons">settings</i> Settings</a></li>
 				%s
 				%s
+				%s
 			</ul>
 		</aside>
 		<div class="main-content">
@@ -209,6 +210,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
 		activeClass(page, "logs"),
 		activeClass(page, "settings"),
 		cveMenu(page),
+		clusterMenu(page),
 		adminMenu(isAdmin, page),
 		content,
 		time.Now().Year(),
@@ -228,6 +230,13 @@ func cveMenu(page string) string {
 				<li class="%s"><a href="/cve"><i class="material-icons">security</i> CVE</a></li>
 				<li class="%s"><a href="/cve/find"><i class="material-icons">find_in_page</i> Find</a></li>
 	`, activeClass(page, "cve"), activeClass(page, "cve-find"))
+}
+
+func clusterMenu(page string) string {
+	return fmt.Sprintf(`
+				<li class="nav-heading">Cluster</li>
+				<li class="%s"><a href="/cluster"><i class="material-icons">cloud_sync</i> Replication</a></li>
+	`, activeClass(page, "cluster"))
 }
 
 func adminMenu(isAdmin bool, page string) string {
