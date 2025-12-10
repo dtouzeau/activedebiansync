@@ -33,6 +33,8 @@ type SyncerProvider interface {
 	Sync()
 	ForceSync() error
 	IsRunning() bool
+	StopSync() bool
+	IsStopping() bool
 }
 
 // PackageManagerProvider interface for package manager
@@ -362,6 +364,7 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/cve", wc.requireAuth(wc.handleCVE))
 	mux.HandleFunc("/cve/find", wc.requireAuth(wc.handleCVEFind))
 	mux.HandleFunc("/sync/trigger", wc.requireAuth(wc.handleSyncTrigger))
+	mux.HandleFunc("/sync/stop", wc.requireAuth(wc.handleSyncStop))
 
 	// API routes for web console
 	mux.HandleFunc("/api/console/stats", wc.requireAuth(wc.handleAPIStats))
@@ -408,8 +411,9 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/console/clients/history", wc.requireAuth(wc.handleAPIClientHistory))
 	mux.HandleFunc("/api/console/clients/cleanup", wc.requireAuth(wc.requireAdmin(wc.handleAPIClientsCleanup)))
 
-	// Cluster replication page
+	// Cluster replication pages
 	mux.HandleFunc("/cluster", wc.requireAuth(wc.handleCluster))
+	mux.HandleFunc("/cluster/events", wc.requireAuth(wc.handleClusterEvents))
 
 	// Cluster replication API
 	mux.HandleFunc("/api/console/cluster/status", wc.requireAuth(wc.handleAPIClusterStatus))
@@ -420,6 +424,8 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/console/cluster/replicate", wc.requireAuth(wc.handleAPIClusterReplicate))
 	mux.HandleFunc("/api/console/cluster/history", wc.requireAuth(wc.handleAPIClusterHistory))
 	mux.HandleFunc("/api/console/cluster/oauth", wc.requireAuth(wc.requireAdmin(wc.handleAPIClusterOAuth)))
+	mux.HandleFunc("/api/console/cluster/toggle", wc.requireAuth(wc.requireAdmin(wc.handleAPIClusterToggle)))
+	mux.HandleFunc("/api/console/cluster/settings", wc.requireAuth(wc.requireAdmin(wc.handleAPIClusterSettings)))
 
 	addr := fmt.Sprintf("%s:%d", cfg.WebConsoleListenAddr, cfg.WebConsolePort)
 
@@ -932,6 +938,58 @@ func (wc *WebConsole) handleSyncTrigger(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// handleSyncStop requests to stop the current sync operation
+func (wc *WebConsole) handleSyncStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	session := wc.getSession(r)
+	w.Header().Set("Content-Type", "application/json")
+
+	if wc.syncer == nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Syncer not available",
+		})
+		return
+	}
+
+	// Check if sync is running using reflection
+	v := reflect.ValueOf(wc.syncer)
+	isRunningMethod := v.MethodByName("IsRunning")
+	if isRunningMethod.IsValid() {
+		results := isRunningMethod.Call(nil)
+		if len(results) > 0 && !results[0].Bool() {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "not_running",
+				"message": "No synchronization is currently running",
+			})
+			return
+		}
+	}
+
+	// Call StopSync using reflection
+	stopMethod := v.MethodByName("StopSync")
+	if stopMethod.IsValid() {
+		results := stopMethod.Call(nil)
+		if len(results) > 0 && results[0].Bool() {
+			wc.logger.LogInfo("User %s requested sync stop", session.Username)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "stopping",
+				"message": "Synchronization stop requested - will stop after current operation",
+			})
+			return
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "error",
+		"message": "Failed to request sync stop",
+	})
+}
+
 // API handlers
 
 func (wc *WebConsole) handleAPIStats(w http.ResponseWriter, r *http.Request) {
@@ -997,7 +1055,8 @@ func (wc *WebConsole) handleAPISyncStatus(w http.ResponseWriter, r *http.Request
 	}
 
 	status := map[string]interface{}{
-		"running": false,
+		"running":  false,
+		"stopping": false,
 	}
 
 	// Use reflection to call methods regardless of concrete return type
@@ -1010,6 +1069,15 @@ func (wc *WebConsole) handleAPISyncStatus(w http.ResponseWriter, r *http.Request
 			results := isRunningMethod.Call(nil)
 			if len(results) > 0 {
 				status["running"] = results[0].Interface()
+			}
+		}
+
+		// Call IsStopping
+		isStoppingMethod := v.MethodByName("IsStopping")
+		if isStoppingMethod.IsValid() {
+			results := isStoppingMethod.Call(nil)
+			if len(results) > 0 {
+				status["stopping"] = results[0].Interface()
 			}
 		}
 
@@ -2632,6 +2700,12 @@ func (wc *WebConsole) handleCluster(w http.ResponseWriter, r *http.Request) {
 	wc.renderCluster(w, r, session)
 }
 
+// handleClusterEvents renders the cluster replication events page
+func (wc *WebConsole) handleClusterEvents(w http.ResponseWriter, r *http.Request) {
+	session := wc.getSession(r)
+	wc.renderClusterEvents(w, r, session)
+}
+
 // handleAPIClusterStatus returns cluster status and configuration
 func (wc *WebConsole) handleAPIClusterStatus(w http.ResponseWriter, r *http.Request) {
 	cfg := wc.config.Get()
@@ -2641,6 +2715,8 @@ func (wc *WebConsole) handleAPIClusterStatus(w http.ResponseWriter, r *http.Requ
 		"node_name":       cfg.ClusterNodeName,
 		"port":            cfg.ClusterPort,
 		"auth_mode":       cfg.ClusterAuthMode,
+		"auth_token":      cfg.ClusterAuthToken,
+		"auth_token_set":  cfg.ClusterAuthToken != "",
 		"auto_replicate":  cfg.ClusterAutoReplicate,
 		"compression":     cfg.ClusterCompression,
 		"bandwidth_limit": cfg.ClusterBandwidthLimit,
@@ -2997,5 +3073,157 @@ func (wc *WebConsole) handleAPIClusterOAuth(w http.ResponseWriter, r *http.Reque
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "success",
 		"message": "OAuth settings saved successfully",
+	})
+}
+
+// handleAPIClusterToggle handles toggling cluster settings (enabled, auto_replicate)
+func (wc *WebConsole) handleAPIClusterToggle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Setting string `json:"setting"`
+		Value   bool   `json:"value"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Invalid request body",
+		})
+		return
+	}
+
+	// Update config based on setting
+	switch req.Setting {
+	case "enabled":
+		wc.config.Update(func(c *config.Config) {
+			c.ClusterEnabled = req.Value
+		})
+		wc.logger.LogInfo("Cluster replication %s via web console", map[bool]string{true: "enabled", false: "disabled"}[req.Value])
+
+	case "auto_replicate":
+		wc.config.Update(func(c *config.Config) {
+			c.ClusterAutoReplicate = req.Value
+		})
+		wc.logger.LogInfo("Cluster auto-replicate %s via web console", map[bool]string{true: "enabled", false: "disabled"}[req.Value])
+
+	default:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Unknown setting: " + req.Setting,
+		})
+		return
+	}
+
+	// Save config
+	if err := wc.config.Save(wc.configPath); err != nil {
+		wc.logger.LogError("Failed to save cluster toggle config: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Failed to save configuration",
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"message": "Setting updated successfully",
+	})
+}
+
+// handleAPIClusterSettings handles updating cluster settings including auth token
+func (wc *WebConsole) handleAPIClusterSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		NodeName       string `json:"node_name"`
+		Port           int    `json:"port"`
+		AuthToken      string `json:"auth_token"`
+		Compression    string `json:"compression"`
+		BandwidthLimit int    `json:"bandwidth_limit"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Invalid request body",
+		})
+		return
+	}
+
+	// Validate node name
+	if req.NodeName == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Node name is required",
+		})
+		return
+	}
+
+	// Validate port
+	if req.Port < 1 || req.Port > 65535 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Port must be between 1 and 65535",
+		})
+		return
+	}
+
+	// Validate compression
+	validCompression := map[string]bool{"zstd": true, "gzip": true, "none": true}
+	if req.Compression != "" && !validCompression[req.Compression] {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Invalid compression type. Must be zstd, gzip, or none",
+		})
+		return
+	}
+
+	// Update config
+	wc.config.Update(func(c *config.Config) {
+		c.ClusterNodeName = req.NodeName
+		c.ClusterPort = req.Port
+		if req.AuthToken != "" {
+			c.ClusterAuthToken = req.AuthToken
+		}
+		if req.Compression != "" {
+			c.ClusterCompression = req.Compression
+		}
+		if req.BandwidthLimit >= 0 {
+			c.ClusterBandwidthLimit = req.BandwidthLimit
+		}
+	})
+
+	wc.logger.LogInfo("Cluster settings updated via web console: node=%s, port=%d", req.NodeName, req.Port)
+
+	// Save config
+	if err := wc.config.Save(wc.configPath); err != nil {
+		wc.logger.LogError("Failed to save cluster settings: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Failed to save configuration",
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"message": "Cluster settings saved successfully",
 	})
 }

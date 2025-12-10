@@ -10,7 +10,7 @@ import (
 // Protocol constants
 const (
 	ProtocolVersion = 1
-	MaxMessageSize  = 64 * 1024 * 1024 // 64MB max message
+	MaxMessageSize  = 256 * 1024 * 1024 // 256MB max message (some .deb packages can be >100MB)
 
 	// Message types
 	MsgHandshake        byte = 0x01
@@ -82,11 +82,11 @@ type FileDataPayload struct {
 
 // ProgressPayload reports transfer progress
 type ProgressPayload struct {
-	TotalFiles  int64  `json:"total_files"`
-	FilesDone   int64  `json:"files_done"`
-	TotalBytes  int64  `json:"total_bytes"`
-	BytesDone   int64  `json:"bytes_done"`
-	CurrentFile string `json:"current_file"`
+	TotalFiles   int64 `json:"total_files"`
+	FilesDone    int64 `json:"files_done"`
+	TotalBytes   int64 `json:"total_bytes"`
+	BytesDone    int64 `json:"bytes_done"`
+	CurrentFile  string `json:"current_file"`
 }
 
 // ErrorPayload reports an error

@@ -46,6 +46,7 @@ type CVEScannerInterface interface {
 // ReplicationManagerInterface defines the interface for cluster replication
 type ReplicationManagerInterface interface {
 	ReplicateToPeers() error
+	IsRunning() bool
 }
 
 // Syncer gère la synchronisation des dépôts Debian
@@ -65,6 +66,7 @@ type Syncer struct {
 	searchDB       *database.PackageSearchDB
 	eventsDB       *database.EventsDB
 	isRunning      atomic.Bool
+	stopRequested  atomic.Bool
 	lastSync       time.Time
 	lastError      error
 	stats          *SyncStats
@@ -259,6 +261,12 @@ func (s *Syncer) doSync(force bool) error {
 		return fmt.Errorf("sync already in progress")
 	}
 
+	// Check if cluster replication is running - skip sync to avoid conflicts
+	if s.replicationMgr != nil && s.replicationMgr.IsRunning() {
+		s.logger.LogInfo("Cluster replication is running, skipping sync to avoid conflicts")
+		return fmt.Errorf("cluster replication in progress")
+	}
+
 	// Vérifier si on est dans la plage horaire autorisée (skip if forced)
 	if !force {
 		s.waitForAllowedHours()
@@ -267,7 +275,11 @@ func (s *Syncer) doSync(force bool) error {
 	}
 
 	s.isRunning.Store(true)
-	defer s.isRunning.Store(false)
+	s.stopRequested.Store(false) // Reset stop flag at start of new sync
+	defer func() {
+		s.isRunning.Store(false)
+		s.stopRequested.Store(false) // Clear stop flag when sync ends
+	}()
 
 	cfg := s.config.Get()
 
@@ -317,10 +329,19 @@ func (s *Syncer) doSync(force bool) error {
 	}
 
 	var syncError error
+	var syncStopped bool
 
 	// Synchroniser d'abord les fichiers Release pour permettre la validation d'intégrité
 	s.setActivity("syncing", "Release metadata", "", "", 0, 0)
 	s.syncMetadata()
+
+	// Check for stop request after metadata sync
+	if s.shouldStop() {
+		s.logger.LogInfo("Sync stopped by user request after metadata sync")
+		syncStopped = true
+		syncError = fmt.Errorf("sync stopped by user request")
+		goto syncEnd
+	}
 
 	// Synchroniser chaque release
 	for _, release := range cfg.DebianReleases {
@@ -343,6 +364,14 @@ func (s *Syncer) doSync(force bool) error {
 			}
 
 			for _, arch := range cfg.DebianArchs {
+				// Check for stop request before each architecture
+				if s.shouldStop() {
+					s.logger.LogInfo("Sync stopped by user request during %s/%s", release, component)
+					syncStopped = true
+					syncError = fmt.Errorf("sync stopped by user request")
+					break
+				}
+
 				s.setActivity("syncing", fmt.Sprintf("Indexes: %s/%s/%s", release, component, arch), release, component, 0, 0)
 				if err := s.syncReleaseComponent(release, component, arch); err != nil {
 					s.logger.LogError("Failed to sync %s/%s/%s: %v", release, component, arch, err)
@@ -353,6 +382,14 @@ func (s *Syncer) doSync(force bool) error {
 
 				// Télécharger les packages .deb si activé
 				if cfg.SyncPackages {
+					// Check for stop request before package download
+					if s.shouldStop() {
+						s.logger.LogInfo("Sync stopped by user request before package download for %s/%s/%s", release, component, arch)
+						syncStopped = true
+						syncError = fmt.Errorf("sync stopped by user request")
+						break
+					}
+
 					s.setActivity("downloading", fmt.Sprintf("Packages: %s/%s/%s", release, component, arch), release, component, 0, 0)
 					if err := s.syncPackages(release, component, arch); err != nil {
 						s.logger.LogError("Failed to sync packages for %s/%s/%s: %v", release, component, arch, err)
@@ -376,6 +413,12 @@ func (s *Syncer) doSync(force bool) error {
 					break
 				}
 			}
+			if syncStopped {
+				break
+			}
+		}
+		if syncStopped {
+			break
 		}
 
 		// Sync additional suites for this release (-updates, -backports, security)
@@ -385,33 +428,45 @@ func (s *Syncer) doSync(force bool) error {
 		}
 	}
 
+	// Check for stop before additional sync tasks
+	if syncStopped {
+		goto syncEnd
+	}
+
 	// Synchroniser les fichiers Contents si activé (pour la recherche de packages)
-	if cfg.SyncContents && cfg.PackageSearchEnabled {
+	if cfg.SyncContents && cfg.PackageSearchEnabled && !s.shouldStop() {
 		s.syncContentsFiles()
 	}
 
 	// Indexer les packages pour la recherche si activé
-	if cfg.PackageSearchEnabled && s.searchDB != nil {
+	if cfg.PackageSearchEnabled && s.searchDB != nil && !s.shouldStop() {
 		s.indexPackagesForSearch()
 	}
 
 	// Synchroniser les composants debian-installer si activé (pour build-simple-cdd, netboot, etc.)
-	if cfg.SyncDebianInstaller {
+	if cfg.SyncDebianInstaller && !s.shouldStop() {
 		s.syncDebianInstaller()
 	}
 
 	// Synchroniser les dépôts Artica si activé
-	if cfg.SyncArticaRepository {
+	if cfg.SyncArticaRepository && !s.shouldStop() {
 		s.syncArticaRepository()
 		s.SyncArticaCores()
 	}
 
 	// Synchroniser les dépôts Ubuntu si activé
-	if cfg.SyncUbuntuRepository && len(cfg.UbuntuReleases) > 0 {
+	if cfg.SyncUbuntuRepository && len(cfg.UbuntuReleases) > 0 && !s.shouldStop() {
 		s.syncUbuntuRepository()
 	}
 
-	// Signer tous les fichiers Release avec GPG si activé
+	// Check if we were stopped during additional tasks
+	if s.shouldStop() {
+		s.logger.LogInfo("Sync stopped by user request during additional tasks")
+		syncStopped = true
+		syncError = fmt.Errorf("sync stopped by user request")
+	}
+
+	// Signer tous les fichiers Release avec GPG si activé (always sign what we have, even if stopped)
 	if s.gpgManager != nil && s.gpgManager.IsEnabled() && syncError == nil {
 		s.logger.LogInfo("Signing all Release files with GPG...")
 		if err := s.gpgManager.SignAllReleaseFiles(); err != nil {
@@ -422,6 +477,7 @@ func (s *Syncer) doSync(force bool) error {
 		}
 	}
 
+syncEnd:
 	endTime := time.Now()
 	duration := endTime.Sub(startTime)
 
@@ -468,7 +524,11 @@ func (s *Syncer) doSync(force bool) error {
 		}()
 	}
 
-	s.logger.LogInfo("Sync completed in %s", duration)
+	if syncStopped {
+		s.logger.LogInfo("Sync stopped by user after %s", duration)
+	} else {
+		s.logger.LogInfo("Sync completed in %s", duration)
+	}
 
 	// Record sync events to the events database
 	s.recordSyncEvents(duration)
@@ -1478,6 +1538,15 @@ func (s *Syncer) downloadWorker(jobs <-chan DownloadJob, results chan<- Download
 	defer wg.Done()
 
 	for job := range jobs {
+		// Check for stop request before each download
+		if s.shouldStop() {
+			results <- DownloadResult{
+				Job:   job,
+				Error: fmt.Errorf("sync stopped by user request"),
+			}
+			continue
+		}
+
 		// Extract filename from path for display
 		filename := filepath.Base(job.LocalPath)
 		s.setActivity("downloading", filename, job.ReleaseName, job.Component, 0, 0)
@@ -1532,6 +1601,27 @@ func (s *Syncer) downloadFilesParallel(jobs []DownloadJob) []DownloadResult {
 // IsRunning retourne true si une synchronisation est en cours
 func (s *Syncer) IsRunning() bool {
 	return s.isRunning.Load()
+}
+
+// StopSync requests the current sync to stop gracefully
+// Returns true if a sync was running and stop was requested, false otherwise
+func (s *Syncer) StopSync() bool {
+	if !s.isRunning.Load() {
+		return false
+	}
+	s.stopRequested.Store(true)
+	s.logger.LogInfo("Sync stop requested - will stop after current operation completes")
+	return true
+}
+
+// IsStopping returns true if a sync stop has been requested
+func (s *Syncer) IsStopping() bool {
+	return s.stopRequested.Load()
+}
+
+// shouldStop checks if sync should be stopped (stop requested)
+func (s *Syncer) shouldStop() bool {
+	return s.stopRequested.Load()
 }
 
 // PackageEntry représente une entrée dans le fichier Packages

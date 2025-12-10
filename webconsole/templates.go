@@ -155,8 +155,11 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
 					<span id="sync-indicator" class="sync-indicator"></span>
 					<span id="sync-status-text">Idle</span>
 				</div>
-				<button onclick="triggerSync()" class="btn btn-primary btn-sm">
+				<button id="sync-now-topbar-btn" onclick="triggerSync()" class="btn btn-primary btn-sm">
 					<i class="material-icons">sync</i> Sync Now
+				</button>
+				<button id="sync-stop-topbar-btn" onclick="stopSync()" class="btn btn-danger btn-sm" style="display:none;margin-left:5px;">
+					<i class="material-icons">stop</i> Stop
 				</button>
 			</div>
 			<div class="content">
@@ -178,18 +181,56 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
 				});
 		}
 
+		function stopSync() {
+			var stopBtn = document.getElementById('sync-stop-topbar-btn');
+			if (stopBtn) {
+				stopBtn.disabled = true;
+				stopBtn.innerHTML = '<i class="material-icons">hourglass_empty</i> Stopping...';
+			}
+			fetch('/sync/stop', { method: 'POST' })
+				.then(response => response.json())
+				.then(data => {
+					updateSyncStatus();
+				})
+				.catch(function() {
+					if (stopBtn) {
+						stopBtn.disabled = false;
+						stopBtn.innerHTML = '<i class="material-icons">stop</i> Stop';
+					}
+				});
+		}
+
 		function updateSyncStatus() {
 			fetch('/api/console/sync/status')
 				.then(response => response.json())
 				.then(data => {
 					var indicator = document.getElementById('sync-indicator');
 					var statusText = document.getElementById('sync-status-text');
+					var syncBtn = document.getElementById('sync-now-topbar-btn');
+					var stopBtn = document.getElementById('sync-stop-topbar-btn');
 					if (data.running) {
 						indicator.className = 'sync-indicator running';
-						statusText.textContent = 'Syncing...';
+						statusText.textContent = data.stopping ? 'Stopping...' : 'Syncing...';
+						if (syncBtn) syncBtn.style.display = 'none';
+						if (stopBtn) {
+							stopBtn.style.display = 'inline-block';
+							if (data.stopping) {
+								stopBtn.disabled = true;
+								stopBtn.innerHTML = '<i class="material-icons">hourglass_empty</i> Stopping...';
+							} else {
+								stopBtn.disabled = false;
+								stopBtn.innerHTML = '<i class="material-icons">stop</i> Stop';
+							}
+						}
 					} else {
 						indicator.className = 'sync-indicator';
 						statusText.textContent = 'Idle';
+						if (syncBtn) syncBtn.style.display = 'inline-block';
+						if (stopBtn) {
+							stopBtn.style.display = 'none';
+							stopBtn.disabled = false;
+							stopBtn.innerHTML = '<i class="material-icons">stop</i> Stop';
+						}
 					}
 				});
 		}
@@ -236,7 +277,8 @@ func clusterMenu(page string) string {
 	return fmt.Sprintf(`
 				<li class="nav-heading">Cluster</li>
 				<li class="%s"><a href="/cluster"><i class="material-icons">cloud_sync</i> Replication</a></li>
-	`, activeClass(page, "cluster"))
+				<li class="%s"><a href="/cluster/events"><i class="material-icons">history</i> Events</a></li>
+	`, activeClass(page, "cluster"), activeClass(page, "cluster-events"))
 }
 
 func adminMenu(isAdmin bool, page string) string {
@@ -258,6 +300,63 @@ func (wc *WebConsole) renderLogin(w http.ResponseWriter, r *http.Request, errorM
 	}
 	staticPath := wc.GetStaticPath()
 
+	// Check OAuth configuration
+	cfg := wc.config.Get()
+	oauthEnabled := cfg.WebConsoleOAuthEnabled && cfg.WebConsoleOAuthClientID != "" && cfg.WebConsoleOAuthAuthURL != ""
+	oauthProviderName := cfg.WebConsoleOAuthProvider
+	if oauthProviderName == "" {
+		oauthProviderName = "OAuth Provider"
+	}
+	allowLocalLogin := cfg.WebConsoleOAuthAllowLocal || !oauthEnabled
+
+	// Build OAuth button HTML
+	oauthButtonHTML := ""
+	if oauthEnabled {
+		oauthButtonHTML = fmt.Sprintf(`
+			<div style="margin-top:20px;text-align:center">
+				<div style="position:relative;margin:20px 0">
+					<hr style="border:0;border-top:1px solid #e0e0e0">
+					<span style="position:absolute;top:50%%;left:50%%;transform:translate(-50%%,-50%%);background:#fff;padding:0 15px;color:#999;font-size:0.9em">or</span>
+				</div>
+				<a href="/oauth/login" class="btn-oauth">
+					<svg style="width:20px;height:20px;margin-right:10px" viewBox="0 0 24 24" fill="currentColor">
+						<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
+					</svg>
+					Sign in with %s
+				</a>
+			</div>`, oauthProviderName)
+	}
+
+	// Build local login form HTML
+	localLoginHTML := ""
+	if allowLocalLogin {
+		localLoginHTML = `
+			<form method="POST" action="/login">
+				<div class="form-group">
+					<label for="username">Username</label>
+					<input type="text" class="form-control" id="username" name="username" required autofocus>
+				</div>
+				<div class="form-group">
+					<label for="password">Password</label>
+					<input type="password" class="form-control" id="password" name="password" required>
+				</div>
+				<button type="submit" class="btn-login">Sign In</button>
+			</form>`
+	} else if oauthEnabled {
+		// OAuth only mode - show only OAuth button
+		localLoginHTML = fmt.Sprintf(`
+			<div style="text-align:center">
+				<p style="color:#666;margin-bottom:20px">Please sign in using your organization account</p>
+				<a href="/oauth/login" class="btn-oauth" style="display:inline-flex">
+					<svg style="width:20px;height:20px;margin-right:10px" viewBox="0 0 24 24" fill="currentColor">
+						<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
+					</svg>
+					Sign in with %s
+				</a>
+			</div>`, oauthProviderName)
+		oauthButtonHTML = "" // Don't show the "or" section in OAuth-only mode
+	}
+
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -268,7 +367,7 @@ func (wc *WebConsole) renderLogin(w http.ResponseWriter, r *http.Request, errorM
 	<link rel="shortcut icon" href="%s/favicon.ico" type="image/x-icon">
 	<link href="%s/css/bootstrap.min.css" rel="stylesheet">
 	<style>
-		:root { --primary: #1976d2; --primary-dark: #1565c0; }
+		:root { --primary: #1976d2; --primary-dark: #1565c0; --oauth: #5c6bc0; --oauth-dark: #3949ab; }
 		body { margin: 0; font-family: 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #1976d2 0%%, #0d47a1 100%%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
 		.login-box { background: #fff; border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,0.3); width: 100%%; max-width: 400px; overflow: hidden; }
 		.login-header { background: #263238; color: #fff; padding: 30px; text-align: center; }
@@ -281,6 +380,8 @@ func (wc *WebConsole) renderLogin(w http.ResponseWriter, r *http.Request, errorM
 		.form-control:focus { outline: none; border-color: var(--primary); }
 		.btn-login { width: 100%%; padding: 14px; background: var(--primary); color: #fff; border: none; border-radius: 6px; font-size: 1em; font-weight: 600; cursor: pointer; transition: background 0.2s; }
 		.btn-login:hover { background: var(--primary-dark); }
+		.btn-oauth { width: 100%%; padding: 14px; background: var(--oauth); color: #fff; border: none; border-radius: 6px; font-size: 1em; font-weight: 600; cursor: pointer; transition: background 0.2s; text-decoration: none; display: flex; align-items: center; justify-content: center; }
+		.btn-oauth:hover { background: var(--oauth-dark); color: #fff; text-decoration: none; }
 		.alert { padding: 12px 16px; border-radius: 6px; margin-bottom: 20px; }
 		.alert-danger { background: #ffebee; color: #c62828; border: 1px solid #ffcdd2; }
 	</style>
@@ -293,21 +394,12 @@ func (wc *WebConsole) renderLogin(w http.ResponseWriter, r *http.Request, errorM
 		</div>
 		<div class="login-body">
 			%s
-			<form method="POST" action="/login">
-				<div class="form-group">
-					<label for="username">Username</label>
-					<input type="text" class="form-control" id="username" name="username" required autofocus>
-				</div>
-				<div class="form-group">
-					<label for="password">Password</label>
-					<input type="password" class="form-control" id="password" name="password" required>
-				</div>
-				<button type="submit" class="btn-login">Sign In</button>
-			</form>
+			%s
+			%s
 		</div>
 	</div>
 </body>
-</html>`, staticPath, staticPath, errorHTML)
+</html>`, staticPath, staticPath, errorHTML, localLoginHTML, oauthButtonHTML)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(html))
@@ -368,7 +460,10 @@ func (wc *WebConsole) renderDashboard(w http.ResponseWriter, r *http.Request, se
 	<div class="card">
 		<div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
 			<span>Sync Status</span>
-			<button id="sync-now-btn" class="btn btn-primary" style="padding:5px 15px;font-size:0.85em" onclick="triggerSync()">Sync Now</button>
+			<div>
+				<button id="sync-now-btn" class="btn btn-primary" style="padding:5px 15px;font-size:0.85em" onclick="triggerSync()">Sync Now</button>
+				<button id="sync-stop-btn" class="btn btn-danger" style="padding:5px 15px;font-size:0.85em;display:none;margin-left:5px" onclick="stopSync()">Stop</button>
+			</div>
 		</div>
 		<div class="card-body">
 			<div id="sync-progress-container" style="display:none;margin-bottom:15px">
@@ -487,6 +582,34 @@ function triggerSync() {
 		});
 }
 
+function stopSync() {
+	var btn = document.getElementById('sync-stop-btn');
+	if (btn) {
+		btn.disabled = true;
+		btn.textContent = 'Stopping...';
+	}
+
+	fetch('/sync/stop', { method: 'POST' })
+		.then(response => response.json())
+		.then(data => {
+			if (data.status === 'stopping') {
+				showNotification('Sync stop requested - will stop after current operation', 'info');
+			} else if (data.status === 'not_running') {
+				showNotification('No sync is currently running', 'info');
+			} else {
+				showNotification(data.message || 'Failed to stop sync', 'error');
+			}
+			updateDashboard();
+		})
+		.catch(err => {
+			showNotification('Error stopping sync: ' + err, 'error');
+			if (btn) {
+				btn.disabled = false;
+				btn.textContent = 'Stop';
+			}
+		});
+}
+
 function showNotification(message, type) {
 	var notification = document.createElement('div');
 	notification.style.cssText = 'position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:6px;color:#fff;font-weight:500;z-index:10000;animation:fadeIn 0.3s ease';
@@ -500,8 +623,9 @@ function showNotification(message, type) {
 	}, 3000);
 }
 
-function updateSyncProgress(isRunning) {
+function updateSyncProgress(isRunning, isStopping) {
 	var btn = document.getElementById('sync-now-btn');
+	var stopBtn = document.getElementById('sync-stop-btn');
 	var progressContainer = document.getElementById('sync-progress-container');
 	var progressBar = document.getElementById('sync-progress-bar');
 	var progressText = document.getElementById('sync-progress-text');
@@ -509,6 +633,17 @@ function updateSyncProgress(isRunning) {
 	if (isRunning) {
 		btn.disabled = true;
 		btn.textContent = 'Syncing...';
+		btn.style.display = 'none';
+		if (stopBtn) {
+			stopBtn.style.display = 'inline-block';
+			if (isStopping) {
+				stopBtn.disabled = true;
+				stopBtn.textContent = 'Stopping...';
+			} else {
+				stopBtn.disabled = false;
+				stopBtn.textContent = 'Stop';
+			}
+		}
 		progressContainer.style.display = 'block';
 
 		// Fetch current activity from API
@@ -577,6 +712,12 @@ function updateSyncProgress(isRunning) {
 	} else {
 		btn.disabled = false;
 		btn.textContent = 'Sync Now';
+		btn.style.display = 'inline-block';
+		if (stopBtn) {
+			stopBtn.style.display = 'none';
+			stopBtn.disabled = false;
+			stopBtn.textContent = 'Stop';
+		}
 
 		// Reset session stats when not running
 		document.getElementById('sync-session-files').textContent = '-';
@@ -601,64 +742,71 @@ function updateSyncProgress(isRunning) {
 }
 
 function updateDashboard() {
-	fetch('/api/console/stats')
-		.then(response => response.json())
-		.then(data => {
-			if (data.sync) {
-				var isRunning = data.sync.is_running;
-				document.getElementById('sync-running').innerHTML = isRunning ?
-					'<span style="color:#28a745;font-weight:500">Running</span>' :
-					'<span style="color:#666">Idle</span>';
-				document.getElementById('sync-last-start').textContent = data.sync.last_sync_start ? new Date(data.sync.last_sync_start).toLocaleString() : '-';
-				document.getElementById('sync-last-end').textContent = data.sync.last_sync_end && !data.sync.last_sync_end.startsWith('0001') ? new Date(data.sync.last_sync_end).toLocaleString() : '-';
-				document.getElementById('sync-duration').textContent = data.sync.last_sync_duration ? formatDuration(data.sync.last_sync_duration) : '-';
-				var failedCount = data.sync.failed_files || 0;
-				var failedEl = document.getElementById('sync-failed');
-				failedEl.textContent = failedCount;
-				if (failedCount > 0) {
-					failedEl.style.color = '#dc3545';
-					failedEl.style.fontWeight = '600';
-					failedEl.style.cursor = 'pointer';
-					failedEl.style.textDecoration = 'underline';
-				} else {
-					failedEl.style.color = '#28a745';
-					failedEl.style.fontWeight = 'normal';
-					failedEl.style.cursor = 'default';
-					failedEl.style.textDecoration = 'none';
-				}
+	// Fetch both stats and sync status in parallel
+	Promise.all([
+		fetch('/api/console/stats').then(r => r.json()),
+		fetch('/api/console/sync/status').then(r => r.json())
+	]).then(function(results) {
+		var data = results[0];
+		var syncStatus = results[1];
+		var isStopping = syncStatus.stopping || false;
 
-				updateSyncProgress(isRunning);
-			}
-			if (data.server) {
-				document.getElementById('stat-requests').textContent = data.server.total_requests || 0;
-				document.getElementById('stat-clients').textContent = data.server.active_clients || 0;
-				document.getElementById('server-http').textContent = data.server.http_enabled ? 'Yes' : 'No';
-				document.getElementById('server-https').textContent = data.server.https_enabled ? 'Yes' : 'No';
-				document.getElementById('server-bytes').textContent = formatBytes(data.server.total_bytes_sent || 0);
-			}
-			if (data.disk) {
-				document.getElementById('stat-repo-size').textContent = formatBytes(data.disk.repository_size || 0);
-				document.getElementById('stat-disk-free').textContent = formatBytes(data.disk.free_bytes || 0);
-			}
-			// Handle disk error display on Repository Size widget
-			var repoSizeCard = document.getElementById('stat-repo-size-card');
-			var repoSizeError = document.getElementById('stat-repo-size-error');
-			if (data.sync && data.sync.disk_error) {
-				repoSizeCard.className = 'stat-card';
-				repoSizeCard.style.borderLeftColor = 'var(--danger)';
-				repoSizeCard.style.background = '#ffebee';
-				repoSizeError.style.display = 'block';
-				repoSizeError.style.color = '#c62828';
-				repoSizeError.style.background = 'rgba(198,40,40,0.1)';
-				repoSizeError.textContent = data.sync.disk_error_message || 'Disk usage full';
+		if (data.sync) {
+			var isRunning = data.sync.is_running;
+			var statusHtml = isRunning ?
+				(isStopping ? '<span style="color:#ffc107;font-weight:500">Stopping...</span>' : '<span style="color:#28a745;font-weight:500">Running</span>') :
+				'<span style="color:#666">Idle</span>';
+			document.getElementById('sync-running').innerHTML = statusHtml;
+			document.getElementById('sync-last-start').textContent = data.sync.last_sync_start ? new Date(data.sync.last_sync_start).toLocaleString() : '-';
+			document.getElementById('sync-last-end').textContent = data.sync.last_sync_end && !data.sync.last_sync_end.startsWith('0001') ? new Date(data.sync.last_sync_end).toLocaleString() : '-';
+			document.getElementById('sync-duration').textContent = data.sync.last_sync_duration ? formatDuration(data.sync.last_sync_duration) : '-';
+			var failedCount = data.sync.failed_files || 0;
+			var failedEl = document.getElementById('sync-failed');
+			failedEl.textContent = failedCount;
+			if (failedCount > 0) {
+				failedEl.style.color = '#dc3545';
+				failedEl.style.fontWeight = '600';
+				failedEl.style.cursor = 'pointer';
+				failedEl.style.textDecoration = 'underline';
 			} else {
-				repoSizeCard.className = 'stat-card primary';
-				repoSizeCard.style.borderLeftColor = '';
-				repoSizeCard.style.background = '';
-				repoSizeError.style.display = 'none';
-				repoSizeError.textContent = '';
+				failedEl.style.color = '#28a745';
+				failedEl.style.fontWeight = 'normal';
+				failedEl.style.cursor = 'default';
+				failedEl.style.textDecoration = 'none';
 			}
-		});
+
+			updateSyncProgress(isRunning, isStopping);
+		}
+		if (data.server) {
+			document.getElementById('stat-requests').textContent = data.server.total_requests || 0;
+			document.getElementById('stat-clients').textContent = data.server.active_clients || 0;
+			document.getElementById('server-http').textContent = data.server.http_enabled ? 'Yes' : 'No';
+			document.getElementById('server-https').textContent = data.server.https_enabled ? 'Yes' : 'No';
+			document.getElementById('server-bytes').textContent = formatBytes(data.server.total_bytes_sent || 0);
+		}
+		if (data.disk) {
+			document.getElementById('stat-repo-size').textContent = formatBytes(data.disk.repository_size || 0);
+			document.getElementById('stat-disk-free').textContent = formatBytes(data.disk.free_bytes || 0);
+		}
+		// Handle disk error display on Repository Size widget
+		var repoSizeCard = document.getElementById('stat-repo-size-card');
+		var repoSizeError = document.getElementById('stat-repo-size-error');
+		if (data.sync && data.sync.disk_error) {
+			repoSizeCard.className = 'stat-card';
+			repoSizeCard.style.borderLeftColor = 'var(--danger)';
+			repoSizeCard.style.background = '#ffebee';
+			repoSizeError.style.display = 'block';
+			repoSizeError.style.color = '#c62828';
+			repoSizeError.style.background = 'rgba(198,40,40,0.1)';
+			repoSizeError.textContent = data.sync.disk_error_message || 'Disk usage full';
+		} else {
+			repoSizeCard.className = 'stat-card primary';
+			repoSizeCard.style.borderLeftColor = '';
+			repoSizeCard.style.background = '';
+			repoSizeError.style.display = 'none';
+			repoSizeError.textContent = '';
+		}
+	});
 }
 
 function showFailedFiles() {

@@ -104,6 +104,7 @@ func (api *RestAPI) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/status", api.withIPFilter(api.handleStatus))
 	mux.HandleFunc("/api/sync/stats", api.withIPFilter(api.handleSyncStats))
 	mux.HandleFunc("/api/sync/trigger", api.withIPFilter(api.handleSyncTrigger))
+	mux.HandleFunc("/api/sync/stop", api.withIPFilter(api.handleSyncStop))
 	mux.HandleFunc("/api/server/stats", api.withIPFilter(api.handleServerStats))
 	mux.HandleFunc("/api/clients", api.withIPFilter(api.handleClients))
 	mux.HandleFunc("/api/disk", api.withIPFilter(api.handleDiskSpace))
@@ -340,6 +341,37 @@ func (api *RestAPI) handleSyncTrigger(w http.ResponseWriter, r *http.Request) {
 		"status":  "triggered",
 		"message": "Synchronization started",
 	})
+}
+
+// handleSyncStop requests to stop the current synchronization
+func (api *RestAPI) handleSyncStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if !api.syncer.IsRunning() {
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "not_running",
+			"message": "No synchronization is currently running",
+		})
+		return
+	}
+
+	if api.syncer.StopSync() {
+		api.logger.LogInfo("Sync stop requested via API")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "stopping",
+			"message": "Synchronization stop requested - will stop after current operation",
+		})
+	} else {
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "error",
+			"message": "Failed to request sync stop",
+		})
+	}
 }
 
 // handleServerStats retourne les statistiques du serveur HTTP

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -18,18 +19,18 @@ import (
 
 // ReplicationStatus represents the current state of replication
 type ReplicationStatus struct {
-	Running      bool      `json:"running"`
-	CurrentPeer  string    `json:"current_peer"`
-	Direction    string    `json:"direction"` // "push" or "pull"
-	Progress     float64   `json:"progress"`  // 0-100
-	CurrentFile  string    `json:"current_file"`
-	FilesTotal   int64     `json:"files_total"`
-	FilesDone    int64     `json:"files_done"`
-	BytesTotal   int64     `json:"bytes_total"`
-	BytesDone    int64     `json:"bytes_done"`
-	StartTime    time.Time `json:"start_time"`
-	EstimatedEnd time.Time `json:"estimated_end"`
-	ErrorMessage string    `json:"error_message,omitempty"`
+	Running       bool      `json:"running"`
+	CurrentPeer   string    `json:"current_peer"`
+	Direction     string    `json:"direction"` // "push" or "pull"
+	Progress      float64   `json:"progress"`  // 0-100
+	CurrentFile   string    `json:"current_file"`
+	FilesTotal    int64     `json:"files_total"`
+	FilesDone     int64     `json:"files_done"`
+	BytesTotal    int64     `json:"bytes_total"`
+	BytesDone     int64     `json:"bytes_done"`
+	StartTime     time.Time `json:"start_time"`
+	EstimatedEnd  time.Time `json:"estimated_end"`
+	ErrorMessage  string    `json:"error_message,omitempty"`
 }
 
 // ReplicationManager handles cluster replication
@@ -38,13 +39,13 @@ type ReplicationManager struct {
 	logger    *utils.Logger
 	clusterDB *database.ClusterDB
 
-	listener net.Listener
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	listener   net.Listener
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
 
-	status   ReplicationStatus
-	statusMu sync.RWMutex
+	status     ReplicationStatus
+	statusMu   sync.RWMutex
 
 	compressor  *Compressor
 	oauthClient *OAuthClient
@@ -52,6 +53,14 @@ type ReplicationManager struct {
 	// Track active connections
 	activeConns   map[string]net.Conn
 	activeConnsMu sync.Mutex
+}
+
+// getPeerAddress returns the peer address with port, using default port if not specified
+func getPeerAddress(address string, defaultPort int) string {
+	if strings.Contains(address, ":") {
+		return address
+	}
+	return fmt.Sprintf("%s:%d", address, defaultPort)
 }
 
 // NewReplicationManager creates a new ReplicationManager
@@ -270,16 +279,20 @@ func (rm *ReplicationManager) handlePullRequest(conn net.Conn, handshake *Handsh
 
 	var bytesTransferred int64
 	var filesTransferred int64
+	var filesSkipped int64
 	var errorMessage string
 	status := "success"
 
 	defer func() {
 		// Record replication end
 		rm.clusterDB.RecordReplicationEnd(eventID, database.ReplicationEvent{
+			NodeName:         handshake.NodeName,
+			Direction:        "push",
 			EndTime:          time.Now(),
 			DurationMs:       time.Since(startTime).Milliseconds(),
 			BytesTransferred: bytesTransferred,
 			FilesTransferred: filesTransferred,
+			FilesSkipped:     filesSkipped,
 			Status:           status,
 			ErrorMessage:     errorMessage,
 		})
@@ -307,7 +320,7 @@ func (rm *ReplicationManager) handlePullRequest(conn net.Conn, handshake *Handsh
 	// Build and send our manifest
 	rm.logger.LogInfo("Building manifest for %s", handshake.NodeName)
 	builder := NewManifestBuilder(cfg.RepositoryPath)
-	manifest, err := builder.Build()
+	manifest, err := builder.BuildFast(nil)
 	if err != nil {
 		rm.logger.LogError("Failed to build manifest: %v", err)
 		errMsg, _ := NewErrorMessage(500, err.Error())
@@ -373,11 +386,11 @@ func (rm *ReplicationManager) handlePullRequest(conn net.Conn, handshake *Handsh
 	// Update status
 	rm.statusMu.Lock()
 	rm.status = ReplicationStatus{
-		Running:     true,
+		Running:    true,
 		CurrentPeer: handshake.NodeName,
-		Direction:   "push",
-		FilesTotal:  int64(len(fileReq.Files)),
-		StartTime:   startTime,
+		Direction:  "push",
+		FilesTotal: int64(len(fileReq.Files)),
+		StartTime:  startTime,
 	}
 	rm.statusMu.Unlock()
 
@@ -389,6 +402,10 @@ func (rm *ReplicationManager) handlePullRequest(conn net.Conn, handshake *Handsh
 
 	// Send requested files
 	compressor := NewCompressor(handshake.Compression)
+	// Max file size we can send (accounting for ~40% JSON/base64 overhead)
+	maxFileSize := int64(MaxMessageSize * 7 / 10)
+	var skippedLargeFiles int64
+
 	for i, filePath := range fileReq.Files {
 		// Update status
 		rm.statusMu.Lock()
@@ -403,6 +420,14 @@ func (rm *ReplicationManager) handlePullRequest(conn net.Conn, handshake *Handsh
 			rm.logger.LogError("Failed to read file %s: %v", filePath, err)
 			errMsg, _ := NewErrorMessage(404, fmt.Sprintf("file not found: %s", filePath))
 			WriteMessage(conn, errMsg)
+			continue
+		}
+
+		// Skip files that are too large for the protocol
+		if int64(len(data)) > maxFileSize {
+			rm.logger.LogInfo("Skipping large file %s (%d MB > %d MB limit)", filePath, len(data)/1024/1024, maxFileSize/1024/1024)
+			skippedLargeFiles++
+			filesSkipped++
 			continue
 		}
 
@@ -436,6 +461,14 @@ func (rm *ReplicationManager) handlePullRequest(conn net.Conn, handshake *Handsh
 		bytesTransferred += int64(len(data))
 		filesTransferred++
 
+		// Aggressive memory management for low-memory systems
+		// Force GC on large files or periodically every 100 files
+		if len(data) > 5*1024*1024 || filesTransferred%100 == 0 {
+			data = nil
+			fileMsg = nil
+			runtime.GC()
+		}
+
 		// Send progress update periodically
 		if i%100 == 0 {
 			progressMsg, _ := NewProgressMessage(
@@ -447,6 +480,10 @@ func (rm *ReplicationManager) handlePullRequest(conn net.Conn, handshake *Handsh
 			)
 			WriteMessage(conn, progressMsg)
 		}
+	}
+
+	if skippedLargeFiles > 0 {
+		rm.logger.LogInfo("Skipped %d files that exceeded size limit", skippedLargeFiles)
 	}
 
 	// Send completion
@@ -478,6 +515,8 @@ func (rm *ReplicationManager) handlePushRequest(conn net.Conn, handshake *Handsh
 
 	defer func() {
 		rm.clusterDB.RecordReplicationEnd(eventID, database.ReplicationEvent{
+			NodeName:         handshake.NodeName,
+			Direction:        "pull",
 			EndTime:          time.Now(),
 			DurationMs:       time.Since(startTime).Milliseconds(),
 			BytesTransferred: bytesTransferred,
@@ -493,7 +532,7 @@ func (rm *ReplicationManager) handlePushRequest(conn net.Conn, handshake *Handsh
 
 	// Build our local manifest
 	builder := NewManifestBuilder(cfg.RepositoryPath)
-	localManifest, err := builder.Build()
+	localManifest, err := builder.BuildFast(nil)
 	if err != nil {
 		rm.logger.LogError("Failed to build local manifest: %v", err)
 		status = "failed"
@@ -561,11 +600,11 @@ func (rm *ReplicationManager) handlePushRequest(conn net.Conn, handshake *Handsh
 	// Update status
 	rm.statusMu.Lock()
 	rm.status = ReplicationStatus{
-		Running:     true,
+		Running:    true,
 		CurrentPeer: handshake.NodeName,
-		Direction:   "pull",
-		FilesTotal:  int64(len(neededFiles)),
-		StartTime:   startTime,
+		Direction:  "pull",
+		FilesTotal: int64(len(neededFiles)),
+		StartTime:  startTime,
 	}
 	rm.statusMu.Unlock()
 
@@ -670,6 +709,19 @@ func (rm *ReplicationManager) handlePushRequest(conn net.Conn, handshake *Handsh
 		rm.status.CurrentFile = fileData.Path
 		rm.status.Progress = float64(filesTransferred) / float64(len(neededFiles)) * 100
 		rm.statusMu.Unlock()
+
+		// Aggressive memory management to prevent OOM on low-memory systems
+		// Clear references to allow GC to reclaim memory
+		fileData.Data = nil
+		fileData = nil
+		msg.Payload = nil
+		msg = nil
+
+		// Force GC on large files or periodically every 100 files
+		if len(data) > 5*1024*1024 || filesTransferred%100 == 0 { // > 5MB or every 100 files
+			data = nil
+			runtime.GC()
+		}
 	}
 
 	rm.logger.LogInfo("Completed receiving from %s: %d files, %d bytes",
@@ -763,6 +815,8 @@ func (rm *ReplicationManager) replicateToPeer(peer config.ClusterPeer) error {
 
 	defer func() {
 		rm.clusterDB.RecordReplicationEnd(eventID, database.ReplicationEvent{
+			NodeName:         peer.Name,
+			Direction:        "push",
 			EndTime:          time.Now(),
 			DurationMs:       time.Since(startTime).Milliseconds(),
 			BytesTransferred: bytesTransferred,
@@ -773,13 +827,14 @@ func (rm *ReplicationManager) replicateToPeer(peer config.ClusterPeer) error {
 		})
 	}()
 
-	// Connect to peer
-	conn, err := net.DialTimeout("tcp", peer.Address, 30*time.Second)
+	// Connect to peer (append default port if not specified)
+	peerAddr := getPeerAddress(peer.Address, cfg.ClusterPort)
+	conn, err := net.DialTimeout("tcp", peerAddr, 30*time.Second)
 	if err != nil {
 		rm.clusterDB.UpdateNodeStatus(peer.Name, "offline", err.Error())
 		status = "failed"
 		errorMessage = err.Error()
-		return fmt.Errorf("failed to connect to %s: %w", peer.Address, err)
+		return fmt.Errorf("failed to connect to %s: %w", peerAddr, err)
 	}
 	defer conn.Close()
 
@@ -841,19 +896,42 @@ func (rm *ReplicationManager) replicateToPeer(peer config.ClusterPeer) error {
 	// Clear deadline for file transfer
 	conn.SetDeadline(time.Time{})
 
-	// Build local manifest
+	// Wait for manifest request from receiver
+	msg, err = ReadMessage(conn)
+	if err != nil {
+		status = "failed"
+		errorMessage = err.Error()
+		return fmt.Errorf("failed to read manifest request: %w", err)
+	}
+
+	if msg.Type != MsgManifestRequest {
+		status = "failed"
+		errorMessage = "expected manifest request"
+		return fmt.Errorf("expected manifest request, got type %d", msg.Type)
+	}
+
+	// Build local manifest with progress logging (using fast mode - size+mtime instead of checksums)
+	rm.logger.LogInfo("Building manifest for %s...", peer.Name)
+	startBuild := time.Now()
 	builder := NewManifestBuilder(cfg.RepositoryPath)
-	manifest, err := builder.Build()
+	lastLog := time.Now()
+	manifest, err := builder.BuildFast(func(current, total int64) {
+		if time.Since(lastLog) > 10*time.Second {
+			rm.logger.LogInfo("Manifest progress: %d/%d files scanned", current, total)
+			lastLog = time.Now()
+		}
+	})
 	if err != nil {
 		status = "failed"
 		errorMessage = err.Error()
 		return fmt.Errorf("failed to build manifest: %w", err)
 	}
+	rm.logger.LogInfo("Manifest built in %v: %d files, %d bytes", time.Since(startBuild), manifest.TotalFiles, manifest.TotalSize)
 
 	manifest.NodeName = cfg.ClusterNodeName
 	manifest.Timestamp = time.Now().Unix()
 
-	// Send manifest
+	// Send manifest response
 	manifestMsg, err := NewManifestMessage(manifest)
 	if err != nil {
 		status = "failed"
@@ -869,7 +947,7 @@ func (rm *ReplicationManager) replicateToPeer(peer config.ClusterPeer) error {
 
 	rm.logger.LogInfo("Sent manifest to %s: %d files (%d bytes)", peer.Name, manifest.TotalFiles, manifest.TotalSize)
 
-	// Wait for file request
+	// Wait for file request or complete
 	msg, err = ReadMessage(conn)
 	if err != nil {
 		status = "failed"
@@ -902,11 +980,11 @@ func (rm *ReplicationManager) replicateToPeer(peer config.ClusterPeer) error {
 	// Update status
 	rm.statusMu.Lock()
 	rm.status = ReplicationStatus{
-		Running:     true,
+		Running:    true,
 		CurrentPeer: peer.Name,
-		Direction:   "push",
-		FilesTotal:  int64(len(fileReq.Files)),
-		StartTime:   startTime,
+		Direction:  "push",
+		FilesTotal: int64(len(fileReq.Files)),
+		StartTime:  startTime,
 	}
 	rm.statusMu.Unlock()
 
@@ -918,6 +996,10 @@ func (rm *ReplicationManager) replicateToPeer(peer config.ClusterPeer) error {
 
 	// Send requested files
 	compressor := NewCompressor(cfg.ClusterCompression)
+	// Max file size we can send (accounting for ~40% JSON/base64 overhead)
+	maxFileSize := int64(MaxMessageSize * 7 / 10)
+	var skippedLargeFiles int64
+
 	for i, filePath := range fileReq.Files {
 		// Update status
 		rm.statusMu.Lock()
@@ -930,6 +1012,14 @@ func (rm *ReplicationManager) replicateToPeer(peer config.ClusterPeer) error {
 		data, err := ReadFile(cfg.RepositoryPath, filePath)
 		if err != nil {
 			rm.logger.LogError("Failed to read file %s: %v", filePath, err)
+			continue
+		}
+
+		// Skip files that are too large for the protocol
+		if int64(len(data)) > maxFileSize {
+			rm.logger.LogInfo("Skipping large file %s (%d MB > %d MB limit)", filePath, len(data)/1024/1024, maxFileSize/1024/1024)
+			skippedLargeFiles++
+			filesSkipped++
 			continue
 		}
 
@@ -962,6 +1052,18 @@ func (rm *ReplicationManager) replicateToPeer(peer config.ClusterPeer) error {
 
 		bytesTransferred += int64(len(data))
 		filesTransferred++
+
+		// Aggressive memory management for low-memory systems
+		// Force GC on large files or periodically every 100 files
+		if len(data) > 5*1024*1024 || filesTransferred%100 == 0 {
+			data = nil
+			fileMsg = nil
+			runtime.GC()
+		}
+	}
+
+	if skippedLargeFiles > 0 {
+		rm.logger.LogInfo("Skipped %d files that exceeded size limit", skippedLargeFiles)
 	}
 
 	// Send completion
@@ -1020,6 +1122,8 @@ func (rm *ReplicationManager) pullFromPeer(peer config.ClusterPeer) error {
 
 	defer func() {
 		rm.clusterDB.RecordReplicationEnd(eventID, database.ReplicationEvent{
+			NodeName:         peer.Name,
+			Direction:        "pull",
 			EndTime:          time.Now(),
 			DurationMs:       time.Since(startTime).Milliseconds(),
 			BytesTransferred: bytesTransferred,
@@ -1030,13 +1134,14 @@ func (rm *ReplicationManager) pullFromPeer(peer config.ClusterPeer) error {
 		})
 	}()
 
-	// Connect to peer
-	conn, err := net.DialTimeout("tcp", peer.Address, 30*time.Second)
+	// Connect to peer (append default port if not specified)
+	peerAddr := getPeerAddress(peer.Address, cfg.ClusterPort)
+	conn, err := net.DialTimeout("tcp", peerAddr, 30*time.Second)
 	if err != nil {
 		rm.clusterDB.UpdateNodeStatus(peer.Name, "offline", err.Error())
 		status = "failed"
 		errorMessage = err.Error()
-		return fmt.Errorf("failed to connect to %s: %w", peer.Address, err)
+		return fmt.Errorf("failed to connect to %s: %w", peerAddr, err)
 	}
 	defer conn.Close()
 
@@ -1131,7 +1236,7 @@ func (rm *ReplicationManager) pullFromPeer(peer config.ClusterPeer) error {
 
 	// Build local manifest
 	builder := NewManifestBuilder(cfg.RepositoryPath)
-	localManifest, err := builder.Build()
+	localManifest, err := builder.BuildFast(nil)
 	if err != nil {
 		status = "failed"
 		errorMessage = err.Error()
@@ -1155,11 +1260,11 @@ func (rm *ReplicationManager) pullFromPeer(peer config.ClusterPeer) error {
 	// Update status
 	rm.statusMu.Lock()
 	rm.status = ReplicationStatus{
-		Running:     true,
+		Running:    true,
 		CurrentPeer: peer.Name,
-		Direction:   "pull",
-		FilesTotal:  int64(len(neededFiles)),
-		StartTime:   startTime,
+		Direction:  "pull",
+		FilesTotal: int64(len(neededFiles)),
+		StartTime:  startTime,
 	}
 	rm.statusMu.Unlock()
 
@@ -1266,6 +1371,13 @@ func (rm *ReplicationManager) GetStatus() interface{} {
 	defer rm.statusMu.RUnlock()
 	status := rm.status
 	return &status
+}
+
+// IsRunning returns true if a replication is currently in progress
+func (rm *ReplicationManager) IsRunning() bool {
+	rm.statusMu.RLock()
+	defer rm.statusMu.RUnlock()
+	return rm.status.Running
 }
 
 // syncPeersToDatabase syncs configured peers to the database

@@ -43,17 +43,37 @@ type ReplicationEvent struct {
 	Status           string    `json:"status"` // "running", "success", "failed", "partial"
 	ErrorMessage     string    `json:"error_message,omitempty"`
 	Compression      string    `json:"compression"`
+	Bandwidth        float64   `json:"bandwidth"` // Calculated bandwidth in bytes/second
+}
+
+// BandwidthString returns a human-readable bandwidth string
+func (e *ReplicationEvent) BandwidthString() string {
+	if e.Bandwidth <= 0 || e.DurationMs <= 0 {
+		return "-"
+	}
+	if e.Bandwidth >= 1024*1024*1024 {
+		return fmt.Sprintf("%.2f GB/s", e.Bandwidth/(1024*1024*1024))
+	}
+	if e.Bandwidth >= 1024*1024 {
+		return fmt.Sprintf("%.2f MB/s", e.Bandwidth/(1024*1024))
+	}
+	if e.Bandwidth >= 1024 {
+		return fmt.Sprintf("%.2f KB/s", e.Bandwidth/1024)
+	}
+	return fmt.Sprintf("%.0f B/s", e.Bandwidth)
 }
 
 // ClusterStats represents aggregated cluster statistics
 type ClusterStats struct {
-	TotalNodes         int64     `json:"total_nodes"`
-	OnlineNodes        int64     `json:"online_nodes"`
-	TotalReplications  int64     `json:"total_replications"`
-	TotalBytesSynced   int64     `json:"total_bytes_synced"`
-	TotalFilesSynced   int64     `json:"total_files_synced"`
-	LastReplication    time.Time `json:"last_replication"`
-	ActiveReplications int64     `json:"active_replications"`
+	TotalNodes          int64     `json:"total_nodes"`
+	OnlineNodes         int64     `json:"online_nodes"`
+	TotalReplications   int64     `json:"total_replications"`
+	TotalBytesSynced    int64     `json:"total_bytes_synced"`
+	TotalFilesSynced    int64     `json:"total_files_synced"`
+	LastReplication     time.Time `json:"last_replication"`
+	ActiveReplications  int64     `json:"active_replications"`
+	AverageBandwidth    float64   `json:"average_bandwidth"`     // Average bandwidth in bytes/second
+	AverageBandwidthStr string    `json:"average_bandwidth_str"` // Human-readable average bandwidth
 }
 
 // ClusterDB manages cluster replication statistics
@@ -287,10 +307,13 @@ func (c *ClusterDB) RecordReplicationStart(event ReplicationEvent) (int64, error
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Format time in SQLite-compatible format
+	startTimeStr := event.StartTime.Format("2006-01-02 15:04:05")
+
 	result, err := c.db.Exec(`
 		INSERT INTO replication_events (node_id, node_name, direction, start_time, status, compression)
 		VALUES (?, ?, ?, ?, 'running', ?)
-	`, event.NodeID, event.NodeName, event.Direction, event.StartTime, event.Compression)
+	`, event.NodeID, event.NodeName, event.Direction, startTimeStr, event.Compression)
 
 	if err != nil {
 		return 0, fmt.Errorf("failed to record replication start: %w", err)
@@ -304,12 +327,15 @@ func (c *ClusterDB) RecordReplicationEnd(eventID int64, event ReplicationEvent) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Format time in SQLite-compatible format
+	endTimeStr := event.EndTime.Format("2006-01-02 15:04:05")
+
 	_, err := c.db.Exec(`
 		UPDATE replication_events
 		SET end_time = ?, duration_ms = ?, bytes_transferred = ?, files_transferred = ?,
 		    files_skipped = ?, status = ?, error_message = ?
 		WHERE id = ?
-	`, event.EndTime, event.DurationMs, event.BytesTransferred, event.FilesTransferred,
+	`, endTimeStr, event.DurationMs, event.BytesTransferred, event.FilesTransferred,
 		event.FilesSkipped, event.Status, event.ErrorMessage, eventID)
 
 	if err != nil {
@@ -317,13 +343,14 @@ func (c *ClusterDB) RecordReplicationEnd(eventID int64, event ReplicationEvent) 
 	}
 
 	// Update node statistics
+	// Treat 'success' and 'partial' as online (partial means data was transferred but connection dropped at end)
 	if event.Direction == "push" {
 		_, err = c.db.Exec(`
 			UPDATE cluster_nodes
 			SET total_pushes = total_pushes + 1,
 			    bytes_pushed = bytes_pushed + ?,
 			    last_seen = CURRENT_TIMESTAMP,
-			    status = CASE WHEN ? = 'success' THEN 'online' ELSE 'error' END,
+			    status = CASE WHEN ? IN ('success', 'partial') THEN 'online' ELSE 'error' END,
 			    last_error = CASE WHEN ? = 'success' THEN NULL ELSE ? END
 			WHERE name = ?
 		`, event.BytesTransferred, event.Status, event.Status, event.ErrorMessage, event.NodeName)
@@ -333,7 +360,7 @@ func (c *ClusterDB) RecordReplicationEnd(eventID int64, event ReplicationEvent) 
 			SET total_pulls = total_pulls + 1,
 			    bytes_pulled = bytes_pulled + ?,
 			    last_seen = CURRENT_TIMESTAMP,
-			    status = CASE WHEN ? = 'success' THEN 'online' ELSE 'error' END,
+			    status = CASE WHEN ? IN ('success', 'partial') THEN 'online' ELSE 'error' END,
 			    last_error = CASE WHEN ? = 'success' THEN NULL ELSE ? END
 			WHERE name = ?
 		`, event.BytesTransferred, event.Status, event.Status, event.ErrorMessage, event.NodeName)
@@ -366,13 +393,13 @@ func (c *ClusterDB) GetRecentEvents(limit int) ([]ReplicationEvent, error) {
 	var events []ReplicationEvent
 	for rows.Next() {
 		var e ReplicationEvent
-		var nodeID sql.NullInt64
+		var nodeID, durationMs, bytesTransferred, filesTransferred, filesSkipped sql.NullInt64
 		var startTime, endTime sql.NullString
 		var errorMsg, compression sql.NullString
 
 		if err := rows.Scan(&e.ID, &nodeID, &e.NodeName, &e.Direction,
-			&startTime, &endTime, &e.DurationMs,
-			&e.BytesTransferred, &e.FilesTransferred, &e.FilesSkipped,
+			&startTime, &endTime, &durationMs,
+			&bytesTransferred, &filesTransferred, &filesSkipped,
 			&e.Status, &errorMsg, &compression); err != nil {
 			return nil, fmt.Errorf("failed to scan event: %w", err)
 		}
@@ -380,11 +407,23 @@ func (c *ClusterDB) GetRecentEvents(limit int) ([]ReplicationEvent, error) {
 		if nodeID.Valid {
 			e.NodeID = nodeID.Int64
 		}
+		if durationMs.Valid {
+			e.DurationMs = durationMs.Int64
+		}
+		if bytesTransferred.Valid {
+			e.BytesTransferred = bytesTransferred.Int64
+		}
+		if filesTransferred.Valid {
+			e.FilesTransferred = filesTransferred.Int64
+		}
+		if filesSkipped.Valid {
+			e.FilesSkipped = filesSkipped.Int64
+		}
 		if startTime.Valid {
-			e.StartTime, _ = time.Parse("2006-01-02 15:04:05", startTime.String)
+			e.StartTime = parseFlexibleTime(startTime.String)
 		}
 		if endTime.Valid {
-			e.EndTime, _ = time.Parse("2006-01-02 15:04:05", endTime.String)
+			e.EndTime = parseFlexibleTime(endTime.String)
 		}
 		if errorMsg.Valid {
 			e.ErrorMessage = errorMsg.String
@@ -393,10 +432,34 @@ func (c *ClusterDB) GetRecentEvents(limit int) ([]ReplicationEvent, error) {
 			e.Compression = compression.String
 		}
 
+		// Calculate bandwidth (bytes per second)
+		if e.DurationMs > 0 && e.BytesTransferred > 0 {
+			e.Bandwidth = float64(e.BytesTransferred) / (float64(e.DurationMs) / 1000.0)
+		}
+
 		events = append(events, e)
 	}
 
 	return events, nil
+}
+
+// parseFlexibleTime parses time strings in various formats
+func parseFlexibleTime(s string) time.Time {
+	// Try multiple formats
+	formats := []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05Z",
+		"2006-01-02T15:04:05-07:00",
+		"2006-01-02 15:04:05.999999999-07:00",
+		time.RFC3339,
+		time.RFC3339Nano,
+	}
+	for _, format := range formats {
+		if t, err := time.Parse(format, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 // GetClusterStats returns aggregated cluster statistics
@@ -423,19 +486,20 @@ func (c *ClusterDB) GetClusterStats() (*ClusterStats, error) {
 		return nil, fmt.Errorf("failed to get total replications: %w", err)
 	}
 
-	err = c.db.QueryRow(`SELECT COALESCE(SUM(bytes_transferred), 0) FROM replication_events WHERE status = 'success'`).Scan(&stats.TotalBytesSynced)
+	// Include both 'success' and 'partial' since partial replications still transferred data
+	err = c.db.QueryRow(`SELECT COALESCE(SUM(bytes_transferred), 0) FROM replication_events WHERE status IN ('success', 'partial')`).Scan(&stats.TotalBytesSynced)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get total bytes synced: %w", err)
 	}
 
-	err = c.db.QueryRow(`SELECT COALESCE(SUM(files_transferred), 0) FROM replication_events WHERE status = 'success'`).Scan(&stats.TotalFilesSynced)
+	err = c.db.QueryRow(`SELECT COALESCE(SUM(files_transferred), 0) FROM replication_events WHERE status IN ('success', 'partial')`).Scan(&stats.TotalFilesSynced)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get total files synced: %w", err)
 	}
 
-	// Get last replication time
+	// Get last replication time (any completed replication)
 	var lastRepStr sql.NullString
-	err = c.db.QueryRow(`SELECT MAX(end_time) FROM replication_events WHERE status = 'success'`).Scan(&lastRepStr)
+	err = c.db.QueryRow(`SELECT MAX(end_time) FROM replication_events WHERE status IN ('success', 'partial')`).Scan(&lastRepStr)
 	if err == nil && lastRepStr.Valid {
 		stats.LastReplication, _ = time.Parse("2006-01-02 15:04:05", lastRepStr.String)
 	}
@@ -444,6 +508,28 @@ func (c *ClusterDB) GetClusterStats() (*ClusterStats, error) {
 	err = c.db.QueryRow(`SELECT COUNT(*) FROM replication_events WHERE status = 'running'`).Scan(&stats.ActiveReplications)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get active replications: %w", err)
+	}
+
+	// Calculate average bandwidth from recent completed replications
+	var totalBytes, totalDurationMs sql.NullInt64
+	err = c.db.QueryRow(`
+		SELECT COALESCE(SUM(bytes_transferred), 0), COALESCE(SUM(duration_ms), 0)
+		FROM replication_events
+		WHERE status IN ('success', 'partial') AND duration_ms > 0
+	`).Scan(&totalBytes, &totalDurationMs)
+	if err == nil && totalDurationMs.Valid && totalDurationMs.Int64 > 0 && totalBytes.Valid {
+		// Calculate bytes per second
+		stats.AverageBandwidth = float64(totalBytes.Int64) / (float64(totalDurationMs.Int64) / 1000.0)
+		// Format as human readable
+		if stats.AverageBandwidth >= 1024*1024*1024 {
+			stats.AverageBandwidthStr = fmt.Sprintf("%.2f GB/s", stats.AverageBandwidth/(1024*1024*1024))
+		} else if stats.AverageBandwidth >= 1024*1024 {
+			stats.AverageBandwidthStr = fmt.Sprintf("%.2f MB/s", stats.AverageBandwidth/(1024*1024))
+		} else if stats.AverageBandwidth >= 1024 {
+			stats.AverageBandwidthStr = fmt.Sprintf("%.2f KB/s", stats.AverageBandwidth/1024)
+		} else {
+			stats.AverageBandwidthStr = fmt.Sprintf("%.0f B/s", stats.AverageBandwidth)
+		}
 	}
 
 	return stats, nil
@@ -474,13 +560,13 @@ func (c *ClusterDB) GetNodeEvents(nodeName string, limit int) ([]ReplicationEven
 	var events []ReplicationEvent
 	for rows.Next() {
 		var e ReplicationEvent
-		var nodeID sql.NullInt64
+		var nodeID, durationMs, bytesTransferred, filesTransferred, filesSkipped sql.NullInt64
 		var startTime, endTime sql.NullString
 		var errorMsg, compression sql.NullString
 
 		if err := rows.Scan(&e.ID, &nodeID, &e.NodeName, &e.Direction,
-			&startTime, &endTime, &e.DurationMs,
-			&e.BytesTransferred, &e.FilesTransferred, &e.FilesSkipped,
+			&startTime, &endTime, &durationMs,
+			&bytesTransferred, &filesTransferred, &filesSkipped,
 			&e.Status, &errorMsg, &compression); err != nil {
 			return nil, fmt.Errorf("failed to scan event: %w", err)
 		}
@@ -488,11 +574,23 @@ func (c *ClusterDB) GetNodeEvents(nodeName string, limit int) ([]ReplicationEven
 		if nodeID.Valid {
 			e.NodeID = nodeID.Int64
 		}
+		if durationMs.Valid {
+			e.DurationMs = durationMs.Int64
+		}
+		if bytesTransferred.Valid {
+			e.BytesTransferred = bytesTransferred.Int64
+		}
+		if filesTransferred.Valid {
+			e.FilesTransferred = filesTransferred.Int64
+		}
+		if filesSkipped.Valid {
+			e.FilesSkipped = filesSkipped.Int64
+		}
 		if startTime.Valid {
-			e.StartTime, _ = time.Parse("2006-01-02 15:04:05", startTime.String)
+			e.StartTime = parseFlexibleTime(startTime.String)
 		}
 		if endTime.Valid {
-			e.EndTime, _ = time.Parse("2006-01-02 15:04:05", endTime.String)
+			e.EndTime = parseFlexibleTime(endTime.String)
 		}
 		if errorMsg.Valid {
 			e.ErrorMessage = errorMsg.String

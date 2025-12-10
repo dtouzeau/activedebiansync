@@ -255,6 +255,73 @@ func (mb *ManifestBuilder) BuildWithProgress(progress func(current int64, total 
 	}, nil
 }
 
+// BuildFast builds the manifest using size+mtime instead of checksums (much faster)
+func (mb *ManifestBuilder) BuildFast(progress func(current int64, total int64)) (*Manifest, error) {
+	// First pass: count files
+	var totalFiles int64
+	err := filepath.Walk(mb.rootPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		if !strings.HasPrefix(filepath.Base(path), ".") {
+			totalFiles++
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Second pass: build manifest without checksums
+	var processed int64
+	err = filepath.Walk(mb.rootPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(mb.rootPath, path)
+		if err != nil {
+			return err
+		}
+
+		if strings.HasPrefix(filepath.Base(relPath), ".") {
+			return nil
+		}
+
+		// Use size+mtime as a pseudo-checksum (much faster)
+		pseudoChecksum := fmt.Sprintf("%d-%d", info.Size(), info.ModTime().UnixNano())
+
+		mb.entries = append(mb.entries, ManifestEntry{
+			Path:     relPath,
+			Size:     info.Size(),
+			ModTime:  info.ModTime().Unix(),
+			Checksum: pseudoChecksum,
+		})
+		mb.total++
+		mb.size += info.Size()
+		processed++
+
+		if progress != nil {
+			progress(processed, totalFiles)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to build manifest: %w", err)
+	}
+
+	return &Manifest{
+		TotalFiles: mb.total,
+		TotalSize:  mb.size,
+		Entries:    mb.entries,
+	}, nil
+}
+
 // CompareManifests compares two manifests and returns files that need to be transferred
 func CompareManifests(local, remote *Manifest) []string {
 	// Build map of local files
