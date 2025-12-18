@@ -36,13 +36,20 @@ type HTTPServer struct {
 	securityDB  *database.SecurityDB
 	clientsDB   *database.ClientsDB
 	wg          sync.WaitGroup
+	startTime   time.Time
 }
 
 // ServerStats contient les statistiques du serveur HTTP
 type ServerStats struct {
-	TotalRequests  int64 `json:"total_requests"`
-	TotalBytesSent int64 `json:"total_bytes_sent"`
-	ActiveClients  int32 `json:"active_clients"`
+	TotalRequests  int64  `json:"total_requests"`
+	TotalBytesSent int64  `json:"total_bytes_sent"`
+	ActiveClients  int32  `json:"active_clients"`
+	HTTPEnabled    bool   `json:"http_enabled"`
+	HTTPSEnabled   bool   `json:"https_enabled"`
+	HTTPPort       int    `json:"http_port"`
+	HTTPSPort      int    `json:"https_port"`
+	Uptime         string `json:"uptime"`
+	UptimeSeconds  int64  `json:"uptime_seconds"`
 }
 
 // ClientInfo contient les informations sur un client connecté
@@ -114,6 +121,7 @@ func NewHTTPServer(cfg *config.Config, logger *utils.Logger) *HTTPServer {
 		stats:       &ServerStats{},
 		clients:     NewClientTracker(),
 		syncChecker: nil, // Sera défini via SetSyncChecker
+		startTime:   time.Now(),
 	}
 }
 
@@ -318,6 +326,7 @@ func (s *HTTPServer) createLoggingHandlerWithHTTPS(next http.Handler, isHTTPS bo
 		// Suivre le client
 		s.clients.Track(clientIP, wrapped.bytesWritten)
 
+		// Enregistrer dans la base de données clients si disponible et si c'est une requête réussie
 		if s.clientsDB != nil && wrapped.statusCode == http.StatusOK && wrapped.bytesWritten > 0 {
 			// Enregistrer l'accès (1 fichier par requête réussie)
 			go func(ip, ua string, bytes int64) {
@@ -325,6 +334,7 @@ func (s *HTTPServer) createLoggingHandlerWithHTTPS(next http.Handler, isHTTPS bo
 			}(clientIP, userAgent, wrapped.bytesWritten)
 		}
 
+		// Enregistrer l'accès dans les analytics si disponible et si c'est une requête réussie
 		if s.analytics != nil && wrapped.statusCode == http.StatusOK && wrapped.bytesWritten > 0 {
 			// Extraire le nom du package depuis le chemin (pour les fichiers .deb)
 			packageName := s.extractPackageName(r.URL.Path)
@@ -380,11 +390,42 @@ func (s *HTTPServer) extractPackageName(path string) string {
 
 // GetStats retourne les statistiques du serveur
 func (s *HTTPServer) GetStats() *ServerStats {
+	cfg := s.config
+	uptime := time.Since(s.startTime)
+
+	// Format uptime as human-readable string
+	uptimeStr := formatDuration(uptime)
+
 	return &ServerStats{
 		TotalRequests:  atomic.LoadInt64(&s.stats.TotalRequests),
 		TotalBytesSent: atomic.LoadInt64(&s.stats.TotalBytesSent),
 		ActiveClients:  atomic.LoadInt32(&s.stats.ActiveClients),
+		HTTPEnabled:    cfg.HTTPEnabled,
+		HTTPSEnabled:   cfg.HTTPSEnabled,
+		HTTPPort:       cfg.HTTPPort,
+		HTTPSPort:      cfg.HTTPSPort,
+		Uptime:         uptimeStr,
+		UptimeSeconds:  int64(uptime.Seconds()),
 	}
+}
+
+// formatDuration formats a duration as a human-readable string
+func formatDuration(d time.Duration) string {
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+
+	if days > 0 {
+		return fmt.Sprintf("%dd %dh %dm", days, hours, minutes)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm %ds", hours, minutes, seconds)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%dm %ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
 
 // LoadStats charge les statistiques depuis des valeurs persistées

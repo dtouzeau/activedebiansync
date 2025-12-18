@@ -3,6 +3,7 @@ package webconsole
 import (
 	"activedebiansync/config"
 	"activedebiansync/database"
+	"activedebiansync/gpg"
 	"activedebiansync/utils"
 	"context"
 	"crypto/rand"
@@ -58,6 +59,9 @@ type ReplicationManagerProvider interface {
 	ReplicateToPeers() error
 	ManualReplicate(peerName string) error
 	PullFromPeer(peerName string) error
+	StopReplication() error
+	IsStopping() bool
+	IsRunning() bool
 }
 
 // WebConsole manages the web console server
@@ -82,6 +86,7 @@ type WebConsole struct {
 	sessionSecret  string
 	basePath       string
 	trustedProxies []string
+	version        string
 	mu             sync.RWMutex
 }
 
@@ -98,11 +103,12 @@ type TemplateData struct {
 }
 
 // NewWebConsole creates a new WebConsole instance
-func NewWebConsole(cfg *config.Config, configPath string, logger *utils.Logger) (*WebConsole, error) {
+func NewWebConsole(cfg *config.Config, configPath string, logger *utils.Logger, version string) (*WebConsole, error) {
 	cfgData := cfg.Get()
 
 	// Initialize users database
-	usersDB, err := database.NewUsersDB(configPath)
+	dbPath := cfg.GetDatabasePath()
+	usersDB, err := database.NewUsersDB(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize users database: %w", err)
 	}
@@ -143,6 +149,7 @@ func NewWebConsole(cfg *config.Config, configPath string, logger *utils.Logger) 
 		sessionSecret:  sessionSecret,
 		basePath:       basePath,
 		trustedProxies: trustedProxies,
+		version:        version,
 	}
 
 	// Initialize OAuth handler
@@ -352,6 +359,7 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	// Protected routes
 	mux.HandleFunc("/", wc.requireAuth(wc.handleDashboard))
 	mux.HandleFunc("/dashboard", wc.requireAuth(wc.handleDashboard))
+	mux.HandleFunc("/repositories-status", wc.requireAuth(wc.handleRepositoriesStatus))
 	mux.HandleFunc("/settings", wc.requireAuth(wc.handleSettings))
 	mux.HandleFunc("/packages", wc.requireAuth(wc.handlePackages))
 	mux.HandleFunc("/packages/upload", wc.requireAuth(wc.handlePackageUpload))
@@ -386,6 +394,8 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/search/file", wc.requireAuth(wc.handleAPISearchFile))
 	mux.HandleFunc("/api/search/package-files", wc.requireAuth(wc.handleAPIPackageFiles))
 	mux.HandleFunc("/api/logs", wc.requireAuth(wc.handleAPILogs))
+	mux.HandleFunc("/api/console/repository/sizes", wc.requireAuth(wc.handleAPIRepositorySizes))
+	mux.HandleFunc("/api/console/repository/scan", wc.requireAuth(wc.handleAPIRepositoryScan))
 
 	// CVE API routes
 	mux.HandleFunc("/api/console/cve/status", wc.requireAuth(wc.handleAPICVEStatus))
@@ -411,6 +421,10 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/console/clients/history", wc.requireAuth(wc.handleAPIClientHistory))
 	mux.HandleFunc("/api/console/clients/cleanup", wc.requireAuth(wc.requireAdmin(wc.handleAPIClientsCleanup)))
 
+	// GPG API
+	mux.HandleFunc("/api/console/gpg/status", wc.requireAuth(wc.handleAPIGPGStatus))
+	mux.HandleFunc("/api/console/gpg/generate", wc.requireAuth(wc.requireAdmin(wc.handleAPIGPGGenerate)))
+
 	// Cluster replication pages
 	mux.HandleFunc("/cluster", wc.requireAuth(wc.handleCluster))
 	mux.HandleFunc("/cluster/events", wc.requireAuth(wc.handleClusterEvents))
@@ -422,6 +436,7 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/console/cluster/nodes/add", wc.requireAuth(wc.requireAdmin(wc.handleAPIClusterNodeAdd)))
 	mux.HandleFunc("/api/console/cluster/nodes/remove", wc.requireAuth(wc.requireAdmin(wc.handleAPIClusterNodeRemove)))
 	mux.HandleFunc("/api/console/cluster/replicate", wc.requireAuth(wc.handleAPIClusterReplicate))
+	mux.HandleFunc("/api/console/cluster/stop", wc.requireAuth(wc.handleAPIClusterStopReplication))
 	mux.HandleFunc("/api/console/cluster/history", wc.requireAuth(wc.handleAPIClusterHistory))
 	mux.HandleFunc("/api/console/cluster/oauth", wc.requireAuth(wc.requireAdmin(wc.handleAPIClusterOAuth)))
 	mux.HandleFunc("/api/console/cluster/toggle", wc.requireAuth(wc.requireAdmin(wc.handleAPIClusterToggle)))
@@ -440,6 +455,9 @@ func (wc *WebConsole) Start(ctx context.Context) error {
 
 	// Start session cleanup goroutine
 	go wc.cleanupSessions(ctx)
+
+	// Start directory size scanner
+	wc.startDirSizeScanner()
 
 	go func() {
 		var err error
@@ -605,6 +623,16 @@ func (wc *WebConsole) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		session := wc.getSession(r)
 		if session == nil {
+			// Return JSON error for API endpoints
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error":   "Unauthorized",
+					"message": "Session expired. Please login again.",
+				})
+				return
+			}
 			http.Redirect(w, r, "/login", http.StatusFound)
 			return
 		}
@@ -1449,6 +1477,11 @@ func (wc *WebConsole) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 		"api_enabled":                     cfg.APIEnabled,
 		"api_port":                        cfg.APIPort,
 		"gpg_signing_enabled":             cfg.GPGSigningEnabled,
+		"gpg_private_key_path":            cfg.GPGPrivateKeyPath,
+		"gpg_public_key_path":             cfg.GPGPublicKeyPath,
+		"gpg_key_name":                    cfg.GPGKeyName,
+		"gpg_key_email":                   cfg.GPGKeyEmail,
+		"gpg_key_comment":                 cfg.GPGKeyComment,
 		"package_search_enabled":          cfg.PackageSearchEnabled,
 		"max_disk_usage_percent":          cfg.MaxDiskUsagePercent,
 		"max_concurrent_downloads":        cfg.MaxConcurrentDownloads,
@@ -1543,6 +1576,25 @@ func (wc *WebConsole) handleAPIConfigUpdate(w http.ResponseWriter, r *http.Reque
 				}
 			}
 			cfg.TranslationLanguages = langs
+		}
+		// GPG settings
+		if v, ok := params["gpg_signing_enabled"].(bool); ok {
+			cfg.GPGSigningEnabled = v
+		}
+		if v, ok := params["gpg_key_name"].(string); ok {
+			cfg.GPGKeyName = v
+		}
+		if v, ok := params["gpg_key_email"].(string); ok {
+			cfg.GPGKeyEmail = v
+		}
+		if v, ok := params["gpg_key_comment"].(string); ok {
+			cfg.GPGKeyComment = v
+		}
+		if v, ok := params["gpg_private_key_path"].(string); ok && v != "" {
+			cfg.GPGPrivateKeyPath = v
+		}
+		if v, ok := params["gpg_public_key_path"].(string); ok && v != "" {
+			cfg.GPGPublicKeyPath = v
 		}
 	})
 
@@ -2982,6 +3034,47 @@ func (wc *WebConsole) handleAPIClusterReplicate(w http.ResponseWriter, r *http.R
 	})
 }
 
+// handleAPIClusterStopReplication stops any running replication
+func (wc *WebConsole) handleAPIClusterStopReplication(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if wc.replicationMgr == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "Replication manager not available",
+		})
+		return
+	}
+
+	if !wc.replicationMgr.IsRunning() {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "not_running",
+			"message": "No replication is currently running",
+		})
+		return
+	}
+
+	if err := wc.replicationMgr.StopReplication(); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "stopping",
+		"message": "Replication stop requested",
+	})
+}
+
 // handleAPIClusterHistory returns replication history
 func (wc *WebConsole) handleAPIClusterHistory(w http.ResponseWriter, r *http.Request) {
 	if wc.clusterDB == nil {
@@ -3226,4 +3319,325 @@ func (wc *WebConsole) handleAPIClusterSettings(w http.ResponseWriter, r *http.Re
 		"status":  "success",
 		"message": "Cluster settings saved successfully",
 	})
+}
+
+// handleAPIGPGStatus returns the status of the GPG key
+func (wc *WebConsole) handleAPIGPGStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	result := map[string]interface{}{
+		"key_exists":  false,
+		"key_id":      "",
+		"key_name":    "",
+		"key_email":   "",
+		"key_created": "",
+		"fingerprint": "",
+	}
+
+	// Create GPGManager instance
+	gpgMgr := gpg.NewGPGManager(wc.config, wc.logger)
+
+	// Check if keys exist
+	if !gpgMgr.KeyExists() {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+		return
+	}
+
+	// Try to load key and get info
+	keyInfo, err := gpgMgr.GetKeyInfo()
+	if err != nil {
+		// Key files exist but can't read info
+		cfg := wc.config.Get()
+		result["key_exists"] = true
+		result["key_name"] = cfg.GPGKeyName
+		result["key_email"] = cfg.GPGKeyEmail
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+		return
+	}
+
+	result["key_exists"] = true
+	result["key_id"] = keyInfo["keyid"]
+	result["key_name"] = keyInfo["name"]
+	result["key_email"] = keyInfo["email"]
+	result["key_created"] = keyInfo["created"]
+	result["fingerprint"] = keyInfo["fingerprint"]
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// handleAPIGPGGenerate generates a new GPG key using pure Go
+func (wc *WebConsole) handleAPIGPGGenerate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		KeyName        string `json:"key_name"`
+		KeyEmail       string `json:"key_email"`
+		KeyComment     string `json:"key_comment"`
+		PrivateKeyPath string `json:"private_key_path"`
+		PublicKeyPath  string `json:"public_key_path"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": fmt.Sprintf("Invalid request: %v", err),
+		})
+		return
+	}
+
+	if req.KeyName == "" || req.KeyEmail == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": "Key name and email are required",
+		})
+		return
+	}
+
+	// Update config with requested paths if provided
+	privateKeyPath := req.PrivateKeyPath
+	publicKeyPath := req.PublicKeyPath
+	if privateKeyPath != "" || publicKeyPath != "" {
+		wc.config.Update(func(c *config.Config) {
+			if privateKeyPath != "" {
+				c.GPGPrivateKeyPath = privateKeyPath
+			}
+			if publicKeyPath != "" {
+				c.GPGPublicKeyPath = publicKeyPath
+			}
+		})
+	}
+
+	// Create GPGManager instance
+	gpgMgr := gpg.NewGPGManager(wc.config, wc.logger)
+
+	// Generate the key using pure Go
+	if err := gpgMgr.GenerateKey(req.KeyName, req.KeyComment, req.KeyEmail); err != nil {
+		wc.logger.LogError("GPG key generation failed: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": fmt.Sprintf("Key generation failed: %v", err),
+		})
+		return
+	}
+
+	// Update config with key info
+	wc.config.Update(func(c *config.Config) {
+		c.GPGKeyName = req.KeyName
+		c.GPGKeyEmail = req.KeyEmail
+		c.GPGKeyComment = req.KeyComment
+	})
+	wc.config.Save(wc.configPath)
+
+	session := wc.getSession(r)
+	wc.logger.LogInfo("User %s generated new GPG key: %s <%s>", session.Username, req.KeyName, req.KeyEmail)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"message": "GPG key generated successfully",
+	})
+}
+
+// DirSizeCache holds cached directory sizes
+type DirSizeCache struct {
+	Pool      []DirSizeEntry `json:"pool"`
+	Dists     []DirSizeEntry `json:"dists"`
+	UpdatedAt string         `json:"updated_at"`
+	mu        sync.RWMutex
+}
+
+// DirSizeEntry represents a directory and its size
+type DirSizeEntry struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+var dirSizeCache = &DirSizeCache{}
+
+// handleAPIRepositorySizes returns sizes of pool and dists subdirectories from cache
+func (wc *WebConsole) handleAPIRepositorySizes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Try to load from cache first
+	dirSizeCache.mu.RLock()
+	hasCache := len(dirSizeCache.Pool) > 0 || len(dirSizeCache.Dists) > 0
+	dirSizeCache.mu.RUnlock()
+
+	if !hasCache {
+		// Try to load from cache file
+		wc.loadDirSizeCache()
+	}
+
+	dirSizeCache.mu.RLock()
+	defer dirSizeCache.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"pool":       dirSizeCache.Pool,
+		"dists":      dirSizeCache.Dists,
+		"updated_at": dirSizeCache.UpdatedAt,
+	})
+}
+
+// getDirSizeCachePath returns the path to the cache file
+func (wc *WebConsole) getDirSizeCachePath() string {
+	cfg := wc.config.Get()
+	dbPath := cfg.DatabasePath
+	if dbPath == "" {
+		dbPath = filepath.Dir(wc.configPath)
+	}
+	return filepath.Join(dbPath, "dir_sizes_cache.json")
+}
+
+// loadDirSizeCache loads directory sizes from cache file
+func (wc *WebConsole) loadDirSizeCache() {
+	cachePath := wc.getDirSizeCachePath()
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		return
+	}
+
+	var cache DirSizeCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return
+	}
+
+	dirSizeCache.mu.Lock()
+	dirSizeCache.Pool = cache.Pool
+	dirSizeCache.Dists = cache.Dists
+	dirSizeCache.UpdatedAt = cache.UpdatedAt
+	dirSizeCache.mu.Unlock()
+}
+
+// saveDirSizeCache saves directory sizes to cache file
+func (wc *WebConsole) saveDirSizeCache() error {
+	cachePath := wc.getDirSizeCachePath()
+
+	dirSizeCache.mu.RLock()
+	data, err := json.MarshalIndent(map[string]interface{}{
+		"pool":       dirSizeCache.Pool,
+		"dists":      dirSizeCache.Dists,
+		"updated_at": dirSizeCache.UpdatedAt,
+	}, "", "  ")
+	dirSizeCache.mu.RUnlock()
+
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(cachePath, data, 0644)
+}
+
+// scanDirSizes scans directory sizes and updates cache
+func (wc *WebConsole) scanDirSizes() {
+	cfg := wc.config.Get()
+	repoPath := cfg.RepositoryPath
+
+	wc.logger.LogInfo("Starting repository directory size scan...")
+
+	getSubdirSizes := func(parentDir string) []DirSizeEntry {
+		var sizes []DirSizeEntry
+		dirPath := filepath.Join(repoPath, parentDir)
+
+		entries, err := os.ReadDir(dirPath)
+		if err != nil {
+			return sizes
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() {
+				subPath := filepath.Join(dirPath, entry.Name())
+				size := getDirSize(subPath)
+				sizes = append(sizes, DirSizeEntry{
+					Name: entry.Name(),
+					Size: size,
+				})
+			}
+		}
+		return sizes
+	}
+
+	poolSizes := getSubdirSizes("pool")
+	distsSizes := getSubdirSizes("dists")
+
+	dirSizeCache.mu.Lock()
+	dirSizeCache.Pool = poolSizes
+	dirSizeCache.Dists = distsSizes
+	dirSizeCache.UpdatedAt = time.Now().Format(time.RFC3339)
+	dirSizeCache.mu.Unlock()
+
+	if err := wc.saveDirSizeCache(); err != nil {
+		wc.logger.LogError("Failed to save directory size cache: %v", err)
+	} else {
+		wc.logger.LogInfo("Repository directory size scan completed and cached")
+	}
+}
+
+// startDirSizeScanner starts the background directory size scanner
+func (wc *WebConsole) startDirSizeScanner() {
+	// Load cache on startup
+	wc.loadDirSizeCache()
+
+	// Run initial scan in background
+	go wc.scanDirSizes()
+
+	// Run scan every 30 minutes
+	go func() {
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			wc.scanDirSizes()
+		}
+	}()
+}
+
+// handleAPIRepositoryScan triggers a manual directory size scan
+func (wc *WebConsole) handleAPIRepositoryScan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Run scan in background
+	go wc.scanDirSizes()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"message": "Directory size scan started",
+	})
+}
+
+// getDirSize calculates total size of a directory recursively
+func getDirSize(path string) int64 {
+	var size int64
+	filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	return size
+}
+
+// handleRepositoriesStatus renders the repositories status page
+func (wc *WebConsole) handleRepositoriesStatus(w http.ResponseWriter, r *http.Request) {
+	session := wc.getSession(r)
+	wc.renderRepositoriesStatus(w, r, session)
 }

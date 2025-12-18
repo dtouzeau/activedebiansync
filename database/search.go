@@ -16,24 +16,24 @@ import (
 
 // PackageSearchResult représente un résultat de recherche
 type PackageSearchResult struct {
-	PackageName string `json:"package_name"`
-	Version     string `json:"version,omitempty"`
-	Description string `json:"description,omitempty"`
-	Section     string `json:"section,omitempty"`
-	Release     string `json:"release"`
-	Component   string `json:"component"`
+	PackageName  string `json:"package_name"`
+	Version      string `json:"version,omitempty"`
+	Description  string `json:"description,omitempty"`
+	Section      string `json:"section,omitempty"`
+	Release      string `json:"release"`
+	Component    string `json:"component"`
 	Architecture string `json:"architecture"`
-	Filename    string `json:"filename,omitempty"`
-	MatchType   string `json:"match_type"` // "name", "description", "file"
-	MatchedFile string `json:"matched_file,omitempty"` // Le fichier qui a matché (pour recherche par fichier)
+	Filename     string `json:"filename,omitempty"`
+	MatchType    string `json:"match_type"`             // "name", "description", "file"
+	MatchedFile  string `json:"matched_file,omitempty"` // Le fichier qui a matché (pour recherche par fichier)
 }
 
 // FileEntry représente une entrée fichier -> package
 type FileEntry struct {
-	FilePath    string
-	PackageName string
-	Release     string
-	Component   string
+	FilePath     string
+	PackageName  string
+	Release      string
+	Component    string
 	Architecture string
 }
 
@@ -45,9 +45,9 @@ type PackageSearchDB struct {
 }
 
 // NewPackageSearchDB crée une nouvelle instance de PackageSearchDB
-func NewPackageSearchDB(configPath string) (*PackageSearchDB, error) {
-	dir := filepath.Dir(configPath)
-	dbPath := filepath.Join(dir, "package_search.db")
+// dbDir is the directory where the database file will be stored
+func NewPackageSearchDB(dbDir string) (*PackageSearchDB, error) {
+	dbPath := filepath.Join(dbDir, "package_search.db")
 
 	db, err := sql.Open("sqlite3", dbPath+"?cache=shared&mode=rwc")
 	if err != nil {
@@ -403,15 +403,15 @@ func (ps *PackageSearchDB) IndexContentsFile(contentsPath, release, component, a
 
 // SearchOptions contient les options de recherche
 type SearchOptions struct {
-	Query        string   // Terme de recherche
-	SearchName   bool     // Chercher dans le nom du package
-	SearchDesc   bool     // Chercher dans la description
-	SearchFiles  bool     // Chercher dans les fichiers
-	Release      string   // Filtrer par release
-	Component    string   // Filtrer par composant
-	Architecture string   // Filtrer par architecture
-	Limit        int      // Nombre max de résultats
-	ExactMatch   bool     // Correspondance exacte (pas LIKE)
+	Query        string // Terme de recherche
+	SearchName   bool   // Chercher dans le nom du package
+	SearchDesc   bool   // Chercher dans la description
+	SearchFiles  bool   // Chercher dans les fichiers
+	Release      string // Filtrer par release
+	Component    string // Filtrer par composant
+	Architecture string // Filtrer par architecture
+	Limit        int    // Nombre max de résultats
+	ExactMatch   bool   // Correspondance exacte (pas LIKE)
 }
 
 // Search effectue une recherche multi-critères
@@ -643,12 +643,12 @@ func (ps *PackageSearchDB) SearchByFile(filePath string, release, arch string, l
 // SearchByName recherche les packages par nom
 func (ps *PackageSearchDB) SearchByName(name string, release string, limit int) ([]*PackageSearchResult, error) {
 	return ps.Search(SearchOptions{
-		Query:      name,
-		SearchName: true,
-		SearchDesc: false,
+		Query:       name,
+		SearchName:  true,
+		SearchDesc:  false,
 		SearchFiles: false,
-		Release:    release,
-		Limit:      limit,
+		Release:     release,
+		Limit:       limit,
 	})
 }
 

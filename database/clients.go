@@ -58,8 +58,9 @@ type ClientsDB struct {
 }
 
 // NewClientsDB creates a new clients database
-func NewClientsDB(configPath string) (*ClientsDB, error) {
-	dbPath := filepath.Join(filepath.Dir(configPath), "clients.db")
+// dbDir is the directory where the database file will be stored
+func NewClientsDB(dbDir string) (*ClientsDB, error) {
+	dbPath := filepath.Join(dbDir, "clients.db")
 
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
@@ -72,7 +73,6 @@ func NewClientsDB(configPath string) (*ClientsDB, error) {
 	}
 
 	if err := clientsDB.initSchema(); err != nil {
-
 		db.Close()
 		return nil, err
 	}

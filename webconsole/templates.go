@@ -28,6 +28,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
 	<link rel="shortcut icon" href="%s/favicon.ico" type="image/x-icon">
 	<link href="%s/css/bootstrap.min.css" rel="stylesheet">
 	<link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+	<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 	<style>
 		:root {
 			--primary: #1976d2;
@@ -128,6 +129,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
 		<aside class="sidebar">
 			<div class="sidebar-header">
 				<h3><span class="logo">A</span> ActiveDebianSync</h3>
+				<div style="font-size:11px;text-align:right;margin-top:-10px;padding-right:24px;color:#90caf9">v%s</div>
 			</div>
 			<div class="sidebar-user">
 				<div class="avatar"><i class="material-icons" style="color:#fff">person</i></div>
@@ -242,6 +244,7 @@ func (wc *WebConsole) baseTemplate(title, page, content string, session *databas
 </html>`,
 		title,
 		staticPath, staticPath, // favicon, bootstrap.css
+		wc.version,
 		username,
 		activeClass(page, "dashboard"),
 		activeClass(page, "packages"),
@@ -437,11 +440,13 @@ func (wc *WebConsole) renderDashboard(w http.ResponseWriter, r *http.Request, se
 <h1 style="margin:0 0 25px;font-size:1.8em;font-weight:400">Dashboard</h1>
 
 <div class="stats-row">
-	<div class="stat-card primary" id="stat-repo-size-card">
-		<p>Repository Size</p>
-		<h2 id="stat-repo-size">-</h2>
-		<div id="stat-repo-size-error" style="display:none;font-size:0.75em;color:#fff;margin-top:5px;padding:5px;background:rgba(0,0,0,0.2);border-radius:4px"></div>
-	</div>
+	<a href="/repositories-status" style="text-decoration:none;color:inherit">
+		<div class="stat-card primary" id="stat-repo-size-card" style="cursor:pointer" title="Click to view repository size details">
+			<p>Repository Size <i class="material-icons" style="font-size:14px;vertical-align:middle;opacity:0.7">open_in_new</i></p>
+			<h2 id="stat-repo-size">-</h2>
+			<div id="stat-repo-size-error" style="display:none;font-size:0.75em;color:#fff;margin-top:5px;padding:5px;background:rgba(0,0,0,0.2);border-radius:4px"></div>
+		</div>
+	</a>
 	<div class="stat-card success">
 		<p>Disk Free</p>
 		<h2 id="stat-disk-free">-</h2>
@@ -477,6 +482,8 @@ func (wc *WebConsole) renderDashboard(w http.ResponseWriter, r *http.Request, se
 			</div>
 			<table class="table">
 				<tr><td><strong>Status</strong></td><td id="sync-running">-</td></tr>
+				<tr id="sync-activity-row" style="display:none"><td><strong>Current Task</strong></td><td id="sync-current-task" style="font-family:monospace;font-size:0.9em">-</td></tr>
+				<tr id="sync-mirror-row" style="display:none"><td><strong>Mirror</strong></td><td id="sync-current-mirror" style="font-size:0.9em">-</td></tr>
 				<tr><td><strong>Last Sync Start</strong></td><td id="sync-last-start">-</td></tr>
 				<tr><td><strong>Last Sync End</strong></td><td id="sync-last-end">-</td></tr>
 				<tr><td><strong>Duration</strong></td><td id="sync-duration">-</td></tr>
@@ -650,11 +657,16 @@ function updateSyncProgress(isRunning, isStopping) {
 		fetch('/api/console/sync/activity')
 			.then(response => response.json())
 			.then(data => {
+				var activityRow = document.getElementById('sync-activity-row');
+				var mirrorRow = document.getElementById('sync-mirror-row');
+				var currentTask = document.getElementById('sync-current-task');
+				var currentMirror = document.getElementById('sync-current-mirror');
+
 				if (data.active && data.activity) {
 					var act = data.activity;
 					var displayText = '';
 
-					// Build activity display text
+					// Build activity display text for progress bar
 					if (act.action === 'downloading') {
 						displayText = 'Downloading: ' + act.file;
 						if (act.suite) {
@@ -689,8 +701,46 @@ function updateSyncProgress(isRunning, isStopping) {
 					// Update session download stats
 					document.getElementById('sync-session-files').textContent = (act.session_files || 0).toLocaleString();
 					document.getElementById('sync-session-bytes').textContent = formatBytes(act.session_bytes || 0);
+
+					// Show current task details in table
+					if (act.action) {
+						activityRow.style.display = '';
+						var taskHtml = '';
+						var actionLabel = act.action.charAt(0).toUpperCase() + act.action.slice(1);
+						if (act.action === 'downloading') {
+							taskHtml = '<span style="color:#1976d2;font-weight:500">' + actionLabel + '</span>';
+							if (act.file) {
+								var shortFile = act.file.length > 50 ? '...' + act.file.slice(-47) : act.file;
+								taskHtml += '<br><span style="color:#666;font-size:0.85em" title="' + act.file + '">' + shortFile + '</span>';
+							}
+							if (act.files_count > 0) {
+								taskHtml += '<br><span style="color:#888;font-size:0.85em">Progress: ' + act.files_done + ' / ' + act.files_count + ' files (' + pct + '%%)</span>';
+							}
+						} else if (act.action === 'verifying' || act.action === 'indexing') {
+							taskHtml = '<span style="color:#ff9800;font-weight:500">' + actionLabel + '</span>';
+							if (act.file) taskHtml += ': ' + act.file;
+						} else {
+							taskHtml = '<span style="font-weight:500">' + actionLabel + '</span>';
+							if (act.file) taskHtml += ': ' + act.file;
+						}
+						currentTask.innerHTML = taskHtml;
+					} else {
+						activityRow.style.display = 'none';
+					}
+
+					// Show mirror info (suite/component)
+					if (act.suite) {
+						mirrorRow.style.display = '';
+						var mirrorText = act.suite;
+						if (act.component) mirrorText += ' / ' + act.component;
+						currentMirror.textContent = mirrorText;
+					} else {
+						mirrorRow.style.display = 'none';
+					}
 				} else {
 					// Fallback if no activity info
+					activityRow.style.display = 'none';
+					mirrorRow.style.display = 'none';
 					if (syncStartTime) {
 						var elapsed = (new Date() - syncStartTime) / 1000;
 						progressBar.style.width = Math.min(95, Math.log10(elapsed + 1) * 30) + '%%';
@@ -705,7 +755,9 @@ function updateSyncProgress(isRunning, isStopping) {
 				}
 			})
 			.catch(function() {
-				// On error, show default
+				// On error, show default and hide activity rows
+				document.getElementById('sync-activity-row').style.display = 'none';
+				document.getElementById('sync-mirror-row').style.display = 'none';
 				progressBar.style.width = '10%%';
 				progressText.textContent = 'Synchronizing...';
 			});
@@ -718,6 +770,10 @@ function updateSyncProgress(isRunning, isStopping) {
 			stopBtn.disabled = false;
 			stopBtn.textContent = 'Stop';
 		}
+
+		// Hide activity rows when not running
+		document.getElementById('sync-activity-row').style.display = 'none';
+		document.getElementById('sync-mirror-row').style.display = 'none';
 
 		// Reset session stats when not running
 		document.getElementById('sync-session-files').textContent = '-';
@@ -780,9 +836,10 @@ function updateDashboard() {
 		if (data.server) {
 			document.getElementById('stat-requests').textContent = data.server.total_requests || 0;
 			document.getElementById('stat-clients').textContent = data.server.active_clients || 0;
-			document.getElementById('server-http').textContent = data.server.http_enabled ? 'Yes' : 'No';
-			document.getElementById('server-https').textContent = data.server.https_enabled ? 'Yes' : 'No';
+			document.getElementById('server-http').textContent = data.server.http_enabled ? 'Yes (port ' + data.server.http_port + ')' : 'No';
+			document.getElementById('server-https').textContent = data.server.https_enabled ? 'Yes (port ' + data.server.https_port + ')' : 'No';
 			document.getElementById('server-bytes').textContent = formatBytes(data.server.total_bytes_sent || 0);
+			document.getElementById('server-uptime').textContent = data.server.uptime || '-';
 		}
 		if (data.disk) {
 			document.getElementById('stat-repo-size').textContent = formatBytes(data.disk.repository_size || 0);
@@ -897,6 +954,339 @@ setInterval(updateDashboard, 3000); // Update more frequently to show sync progr
 	w.Write([]byte(html))
 }
 
+// renderRepositoriesStatus renders the repositories status page with pie charts
+func (wc *WebConsole) renderRepositoriesStatus(w http.ResponseWriter, r *http.Request, session *database.Session) {
+	content := `
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:25px">
+	<h1 style="margin:0;font-size:1.8em;font-weight:400">
+		<a href="/dashboard" style="color:#1976d2;text-decoration:none"><i class="material-icons" style="vertical-align:middle">arrow_back</i></a>
+		Repository Size Details
+	</h1>
+	<div style="display:flex;align-items:center;gap:15px">
+		<span id="last-updated" style="color:#666;font-size:0.9em"></span>
+		<button id="scan-btn" class="btn btn-primary" onclick="triggerScan()" style="display:flex;align-items:center;gap:5px">
+			<i class="material-icons" style="font-size:18px">refresh</i> Scan Now
+		</button>
+	</div>
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+	<div class="card">
+		<div class="card-header">Pool Directory</div>
+		<div class="card-body">
+			<div id="pool-loading" style="text-align:center;padding:40px;color:#666">
+				<i class="material-icons" style="font-size:48px;animation:spin 1s linear infinite">refresh</i>
+				<p>Loading...</p>
+			</div>
+			<canvas id="pool-chart" style="display:none;max-height:350px"></canvas>
+			<div id="pool-legend" style="margin-top:15px"></div>
+			<div id="pool-total" style="margin-top:10px;font-weight:bold;color:#333"></div>
+		</div>
+	</div>
+	<div class="card">
+		<div class="card-header">Dists Directory</div>
+		<div class="card-body">
+			<div id="dists-loading" style="text-align:center;padding:40px;color:#666">
+				<i class="material-icons" style="font-size:48px;animation:spin 1s linear infinite">refresh</i>
+				<p>Loading...</p>
+			</div>
+			<canvas id="dists-chart" style="display:none;max-height:350px"></canvas>
+			<div id="dists-legend" style="margin-top:15px"></div>
+			<div id="dists-total" style="margin-top:10px;font-weight:bold;color:#333"></div>
+		</div>
+	</div>
+</div>
+
+<div class="card" style="margin-top:20px">
+	<div class="card-header">Repository Size by OS Family</div>
+	<div class="card-body">
+		<div id="family-loading" style="text-align:center;padding:20px;color:#666">
+			<i class="material-icons" style="font-size:24px;animation:spin 1s linear infinite">refresh</i>
+			<span style="margin-left:10px">Loading...</span>
+		</div>
+		<table id="family-table" class="table" style="display:none;width:100%%">
+			<thead>
+				<tr>
+					<th style="text-align:left;padding:12px 15px;border-bottom:2px solid #dee2e6">OS Family</th>
+					<th style="text-align:right;padding:12px 15px;border-bottom:2px solid #dee2e6">Repository Size</th>
+				</tr>
+			</thead>
+			<tbody id="family-tbody">
+			</tbody>
+		</table>
+	</div>
+</div>
+
+<style>
+@keyframes spin {
+	0%% { transform: rotate(0deg); }
+	100%% { transform: rotate(360deg); }
+}
+.legend-item {
+	display: inline-flex;
+	align-items: center;
+	margin: 5px 15px 5px 0;
+	font-size: 0.9em;
+}
+.legend-color {
+	width: 14px;
+	height: 14px;
+	border-radius: 3px;
+	margin-right: 6px;
+}
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+var poolChart = null;
+var distsChart = null;
+
+var colors = [
+	'#1976d2', '#4caf50', '#ff9800', '#e91e63', '#9c27b0',
+	'#00bcd4', '#795548', '#607d8b', '#f44336', '#3f51b5',
+	'#009688', '#cddc39', '#ffc107', '#673ab7', '#2196f3'
+];
+
+function formatBytes(bytes) {
+	if (bytes === 0) return '0 B';
+	var k = 1024;
+	var sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+	var i = Math.floor(Math.log(bytes) / Math.log(k));
+	return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function createPieChart(canvasId, data, legendId, totalId) {
+	var canvas = document.getElementById(canvasId);
+	var ctx = canvas.getContext('2d');
+
+	var labels = data.map(function(d) { return d.name; });
+	var sizes = data.map(function(d) { return d.size; });
+	var total = sizes.reduce(function(a, b) { return a + b; }, 0);
+
+	var chartColors = colors.slice(0, data.length);
+
+	var chart = new Chart(ctx, {
+		type: 'pie',
+		data: {
+			labels: labels,
+			datasets: [{
+				data: sizes,
+				backgroundColor: chartColors,
+				borderWidth: 2,
+				borderColor: '#fff'
+			}]
+		},
+		options: {
+			responsive: true,
+			maintainAspectRatio: true,
+			plugins: {
+				legend: {
+					display: false
+				},
+				tooltip: {
+					callbacks: {
+						label: function(context) {
+							var value = context.raw;
+							var percentage = ((value / total) * 100).toFixed(1);
+							return context.label + ': ' + formatBytes(value) + ' (' + percentage + '%%)';
+						}
+					}
+				}
+			}
+		}
+	});
+
+	// Create custom legend
+	var legendHtml = '';
+	data.forEach(function(d, i) {
+		var percentage = ((d.size / total) * 100).toFixed(1);
+		legendHtml += '<div class="legend-item">';
+		legendHtml += '<span class="legend-color" style="background:' + chartColors[i] + '"></span>';
+		legendHtml += '<span>' + d.name + ': ' + formatBytes(d.size) + ' (' + percentage + '%%)</span>';
+		legendHtml += '</div>';
+	});
+	document.getElementById(legendId).innerHTML = legendHtml;
+	document.getElementById(totalId).textContent = 'Total: ' + formatBytes(total);
+
+	return chart;
+}
+
+function getTop10WithOthers(data) {
+	// Filter out directories under 1MB
+	var minSize = 1024 * 1024; // 1MB
+	var filtered = data.filter(function(d) { return d.size >= minSize; });
+	if (filtered.length === 0) return data; // Show all if none meet threshold
+
+	// Sort by size descending
+	filtered.sort(function(a, b) { return b.size - a.size; });
+
+	if (filtered.length <= 10) return filtered;
+
+	var top10 = filtered.slice(0, 10);
+	var others = filtered.slice(10);
+	var othersSize = others.reduce(function(sum, d) { return sum + d.size; }, 0);
+	if (othersSize > 0) {
+		top10.push({ name: 'Others (' + others.length + ')', size: othersSize });
+	}
+	return top10;
+}
+
+function getOSFamily(name) {
+	// Extract base OS family name (e.g., "bookworm-updates" -> "bookworm")
+	// Common patterns: bookworm, bookworm-updates, bookworm-security, bookworm-backports
+	var families = ['bookworm', 'trixie', 'bullseye', 'buster', 'stretch', 'jessie',
+		'noble', 'jammy', 'focal', 'bionic', 'xenial', 'trusty',
+		'mantic', 'lunar', 'kinetic', 'impish', 'hirsute', 'groovy'];
+	var lowerName = name.toLowerCase();
+	for (var i = 0; i < families.length; i++) {
+		if (lowerName.indexOf(families[i]) === 0) {
+			// Capitalize first letter
+			return families[i].charAt(0).toUpperCase() + families[i].slice(1);
+		}
+	}
+	return name; // Return as-is if no match
+}
+
+function groupByOSFamily(data) {
+	var families = {};
+	data.forEach(function(d) {
+		var family = getOSFamily(d.name);
+		if (!families[family]) {
+			families[family] = 0;
+		}
+		families[family] += d.size;
+	});
+	// Convert to array and sort by size descending
+	var result = [];
+	for (var family in families) {
+		result.push({ name: family, size: families[family] });
+	}
+	result.sort(function(a, b) { return b.size - a.size; });
+	return result;
+}
+
+function loadRepositorySizes() {
+	fetch('/api/console/repository/sizes')
+		.then(function(response) { return response.json(); })
+		.then(function(data) {
+			// Update last updated timestamp
+			if (data.updated_at) {
+				document.getElementById('last-updated').textContent = 'Last updated: ' + data.updated_at;
+			}
+
+			// Pool chart
+			document.getElementById('pool-loading').style.display = 'none';
+			var poolCanvas = document.getElementById('pool-chart');
+			if (data.pool && data.pool.length > 0) {
+				poolCanvas.style.display = 'block';
+				var poolData = getTop10WithOthers(data.pool);
+				poolChart = createPieChart('pool-chart', poolData, 'pool-legend', 'pool-total');
+			} else {
+				document.getElementById('pool-legend').innerHTML = '<p style="color:#666;font-style:italic">No subdirectories found in pool/</p>';
+			}
+
+			// Dists chart
+			document.getElementById('dists-loading').style.display = 'none';
+			var distsCanvas = document.getElementById('dists-chart');
+			if (data.dists && data.dists.length > 0) {
+				distsCanvas.style.display = 'block';
+				var distsData = getTop10WithOthers(data.dists);
+				distsChart = createPieChart('dists-chart', distsData, 'dists-legend', 'dists-total');
+			} else {
+				document.getElementById('dists-legend').innerHTML = '<p style="color:#666;font-style:italic">No subdirectories found in dists/</p>';
+			}
+
+			// OS Family table - aggregate both pool and dists
+			document.getElementById('family-loading').style.display = 'none';
+			var familyTable = document.getElementById('family-table');
+			var tbody = document.getElementById('family-tbody');
+			if (data.dists && data.dists.length > 0) {
+				var families = groupByOSFamily(data.dists);
+
+				// Calculate total pool size
+				var totalPoolSize = 0;
+				if (data.pool && data.pool.length > 0) {
+					totalPoolSize = data.pool.reduce(function(sum, d) { return sum + d.size; }, 0);
+				}
+
+				// Calculate total dists size for proportional distribution
+				var totalDistsSize = families.reduce(function(sum, f) { return sum + f.size; }, 0);
+
+				var html = '';
+				families.forEach(function(f) {
+					// Distribute pool size proportionally based on dists ratio
+					var poolShare = totalDistsSize > 0 ? (f.size / totalDistsSize) * totalPoolSize : 0;
+					var totalSize = f.size + poolShare;
+
+					html += '<tr>';
+					html += '<td style="padding:10px 15px;border-bottom:1px solid #eee">' + f.name + '</td>';
+					html += '<td style="padding:10px 15px;border-bottom:1px solid #eee;text-align:right">' + formatBytes(totalSize) + '</td>';
+					html += '</tr>';
+				});
+
+				// Add total row
+				var grandTotal = totalDistsSize + totalPoolSize;
+				html += '<tr style="font-weight:bold;background:#f8f9fa">';
+				html += '<td style="padding:10px 15px;border-top:2px solid #dee2e6">Total</td>';
+				html += '<td style="padding:10px 15px;border-top:2px solid #dee2e6;text-align:right">' + formatBytes(grandTotal) + '</td>';
+				html += '</tr>';
+
+				tbody.innerHTML = html;
+				familyTable.style.display = 'table';
+			} else {
+				tbody.innerHTML = '<tr><td colspan="2" style="padding:15px;text-align:center;color:#666;font-style:italic">No repositories found</td></tr>';
+				familyTable.style.display = 'table';
+			}
+		})
+		.catch(function(err) {
+			document.getElementById('pool-loading').innerHTML = '<p style="color:#dc3545">Error loading data: ' + err + '</p>';
+			document.getElementById('dists-loading').innerHTML = '<p style="color:#dc3545">Error loading data: ' + err + '</p>';
+			document.getElementById('family-loading').innerHTML = '<p style="color:#dc3545">Error loading data: ' + err + '</p>';
+		});
+}
+
+function triggerScan() {
+	var btn = document.getElementById('scan-btn');
+	btn.disabled = true;
+	btn.innerHTML = '<i class="material-icons" style="font-size:18px;animation:spin 1s linear infinite">refresh</i> Scanning...';
+
+	fetch('/api/console/repository/scan', { method: 'POST' })
+		.then(function(response) { return response.json(); })
+		.then(function(data) {
+			Swal.fire({
+				icon: 'success',
+				title: 'Scan Started',
+				text: data.message || 'Directory size scan has been started',
+				timer: 3000,
+				showConfirmButton: false
+			});
+			// Reload data after a short delay
+			setTimeout(function() {
+				loadRepositorySizes();
+				btn.disabled = false;
+				btn.innerHTML = '<i class="material-icons" style="font-size:18px">refresh</i> Scan Now';
+			}, 5000);
+		})
+		.catch(function(err) {
+			Swal.fire({
+				icon: 'error',
+				title: 'Error',
+				text: 'Failed to start scan: ' + err
+			});
+			btn.disabled = false;
+			btn.innerHTML = '<i class="material-icons" style="font-size:18px">refresh</i> Scan Now';
+		});
+}
+
+loadRepositorySizes();
+</script>
+`
+
+	html := wc.baseTemplate("Repository Status", "dashboard", content, session)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(html))
+}
+
 // renderSettings renders the settings page
 func (wc *WebConsole) renderSettings(w http.ResponseWriter, r *http.Request, session *database.Session) {
 	isAdmin := session != nil && session.Role == "admin"
@@ -920,6 +1310,13 @@ func (wc *WebConsole) renderSettings(w http.ResponseWriter, r *http.Request, ses
 				<div class="form-group">
 					<label>Max Concurrent Downloads</label>
 					<input type="number" class="form-control" id="max_concurrent_downloads" min="1" max="32">
+				</div>
+
+				<h4 style="margin:20px 0 15px;padding-top:15px;border-top:1px solid #eee">Storage</h4>
+				<div class="form-group">
+					<label>Database Path</label>
+					<input type="text" class="form-control" id="database_path" placeholder="Leave empty for default (config directory)">
+					<small style="display:block;color:#666;margin-top:4px">Directory where all SQLite databases are stored. Default: same as config directory</small>
 				</div>
 
 				<h4 style="margin:20px 0 15px;padding-top:15px;border-top:1px solid #eee">Sync Time Restriction</h4>
@@ -994,6 +1391,7 @@ func (wc *WebConsole) renderSettings(w http.ResponseWriter, r *http.Request, ses
 			<div class="card-body">
 				<table class="table">
 					<tr><td>Repository Path</td><td id="cfg-repo-path">-</td></tr>
+					<tr><td>Database Path</td><td id="cfg-db-path">-</td></tr>
 					<tr><td colspan="2" style="background:#f5f5f5;font-weight:600">Debian</td></tr>
 					<tr><td>Mirror</td><td id="cfg-mirror">-</td></tr>
 					<tr><td>Releases</td><td id="cfg-releases">-</td></tr>
@@ -1150,6 +1548,51 @@ func (wc *WebConsole) renderSettings(w http.ResponseWriter, r *http.Request, ses
 				</form>
 			</div>
 		</div>
+		<div class="card">
+			<div class="card-header">GPG Package Signing</div>
+			<div class="card-body">
+				<div id="gpg-status" style="padding:12px;border-radius:4px;margin-bottom:15px;background:#f5f5f5">
+					<strong>GPG Key Status:</strong> <span id="gpg-status-text">Checking...</span>
+				</div>
+				<form id="gpg-form">
+					<div class="form-group">
+						<label><input type="checkbox" id="gpg_signing_enabled"> Enable GPG Signing</label>
+						<small style="display:block;color:#666;margin-top:4px">Sign Release files with GPG key for secure package distribution</small>
+					</div>
+					<div id="gpg-fields">
+						<div class="form-group">
+							<label>Key Name</label>
+							<input type="text" class="form-control" id="gpg_key_name" placeholder="My Organization Repository">
+						</div>
+						<div class="form-group">
+							<label>Key Email</label>
+							<input type="text" class="form-control" id="gpg_key_email" placeholder="repo@example.com">
+						</div>
+						<div class="form-group">
+							<label>Key Comment</label>
+							<input type="text" class="form-control" id="gpg_key_comment" placeholder="Package signing key">
+						</div>
+						<div class="form-group">
+							<label>Private Key Path</label>
+							<input type="text" class="form-control" id="gpg_private_key_path" placeholder="/etc/ActiveDebianSync/gpg/private.key">
+						</div>
+						<div class="form-group">
+							<label>Public Key Path</label>
+							<input type="text" class="form-control" id="gpg_public_key_path" placeholder="/etc/ActiveDebianSync/gpg/public.key">
+						</div>
+					</div>
+					<div style="display:flex;gap:10px;flex-wrap:wrap">
+						<button type="submit" class="btn btn-primary">Save GPG Settings</button>
+						<button type="button" class="btn btn-secondary" onclick="generateGPGKey()">Generate New Key</button>
+						<button type="button" class="btn btn-secondary" onclick="refreshGPGStatus()">Refresh Status</button>
+					</div>
+				</form>
+				<div id="gpg-key-info" style="display:none;margin-top:15px;padding:12px;background:#e8f5e9;border-radius:4px">
+					<strong>Key Information:</strong><br>
+					<pre id="gpg-key-details" style="margin:10px 0 0;font-size:12px;white-space:pre-wrap"></pre>
+				</div>
+			</div>
+		</div>
 	</div>
 </div>
 <script>
@@ -1164,7 +1607,9 @@ function loadConfig() {
 			document.getElementById('sync_interval').value = data.sync_interval || 60;
 			document.getElementById('max_disk_usage_percent').value = data.max_disk_usage_percent || 90;
 			document.getElementById('max_concurrent_downloads').value = data.max_concurrent_downloads || 4;
+			document.getElementById('database_path').value = data.database_path || '';
 			document.getElementById('cfg-repo-path').textContent = data.repository_path || '-';
+			document.getElementById('cfg-db-path').textContent = data.database_path || '(default: config directory)';
 			document.getElementById('cfg-mirror').textContent = data.debian_mirror || '-';
 			document.getElementById('cfg-releases').textContent = (data.debian_releases || []).join(', ');
 			document.getElementById('cfg-archs').textContent = (data.debian_architectures || []).join(', ');
@@ -1232,8 +1677,176 @@ function loadConfig() {
 			document.getElementById('server-cert-path').textContent = data.tls_cert_file || '-';
 
 			updateSSLUI();
+
+			// GPG settings
+			document.getElementById('gpg_signing_enabled').checked = data.gpg_signing_enabled || false;
+			document.getElementById('gpg_key_name').value = data.gpg_key_name || '';
+			document.getElementById('gpg_key_email').value = data.gpg_key_email || '';
+			document.getElementById('gpg_key_comment').value = data.gpg_key_comment || '';
+			document.getElementById('gpg_private_key_path').value = data.gpg_private_key_path || '/etc/ActiveDebianSync/gpg/private.key';
+			document.getElementById('gpg_public_key_path').value = data.gpg_public_key_path || '/etc/ActiveDebianSync/gpg/public.key';
+			updateGPGUI();
+			refreshGPGStatus();
 		});
 }
+
+function updateGPGUI() {
+	var enabled = document.getElementById('gpg_signing_enabled').checked;
+	document.getElementById('gpg-fields').style.display = enabled ? 'block' : 'none';
+}
+
+function refreshGPGStatus() {
+	document.getElementById('gpg-status-text').textContent = 'Checking...';
+	document.getElementById('gpg-status').style.background = '#f5f5f5';
+	fetch('/api/console/gpg/status')
+		.then(response => response.json())
+		.then(data => {
+			if (data.error) {
+				document.getElementById('gpg-status-text').textContent = 'Error: ' + data.error;
+				document.getElementById('gpg-status').style.background = '#ffebee';
+				document.getElementById('gpg-key-info').style.display = 'none';
+			} else if (data.key_exists) {
+				document.getElementById('gpg-status-text').innerHTML = '<span style="color:#4caf50">Key Available</span>';
+				document.getElementById('gpg-status').style.background = '#e8f5e9';
+				document.getElementById('gpg-key-info').style.display = 'block';
+				var details = 'Key ID: ' + (data.key_id || 'N/A') + '\n';
+				details += 'Name: ' + (data.key_name || 'N/A') + '\n';
+				details += 'Email: ' + (data.key_email || 'N/A') + '\n';
+				details += 'Created: ' + (data.key_created || 'N/A') + '\n';
+				details += 'Fingerprint: ' + (data.fingerprint || 'N/A');
+				document.getElementById('gpg-key-details').textContent = details;
+			} else {
+				document.getElementById('gpg-status-text').innerHTML = '<span style="color:#ff9800">No Key Found</span>';
+				document.getElementById('gpg-status').style.background = '#fff3e0';
+				document.getElementById('gpg-key-info').style.display = 'none';
+			}
+		})
+		.catch(err => {
+			document.getElementById('gpg-status-text').textContent = 'Failed to check: ' + err;
+			document.getElementById('gpg-status').style.background = '#ffebee';
+		});
+}
+
+function generateGPGKey() {
+	var keyName = document.getElementById('gpg_key_name').value.trim();
+	var keyEmail = document.getElementById('gpg_key_email').value.trim();
+	var keyComment = document.getElementById('gpg_key_comment').value.trim();
+
+	if (!keyName || !keyEmail) {
+		Swal.fire({
+			icon: 'warning',
+			title: 'Missing Information',
+			text: 'Please enter Key Name and Key Email before generating a key.'
+		});
+		return;
+	}
+
+	Swal.fire({
+		icon: 'question',
+		title: 'Generate GPG Key?',
+		text: 'This will generate a new GPG key and replace any existing key.',
+		showCancelButton: true,
+		confirmButtonText: 'Generate',
+		confirmButtonColor: '#1976d2'
+	}).then((result) => {
+		if (result.isConfirmed) {
+			document.getElementById('gpg-status-text').textContent = 'Generating key... (this may take a minute)';
+			document.getElementById('gpg-status').style.background = '#e3f2fd';
+
+			fetch('/api/console/gpg/generate', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					key_name: keyName,
+					key_email: keyEmail,
+					key_comment: keyComment,
+					private_key_path: document.getElementById('gpg_private_key_path').value,
+					public_key_path: document.getElementById('gpg_public_key_path').value
+				})
+			})
+			.then(response => response.json())
+			.then(data => {
+				if (data.error) {
+					Swal.fire({
+						icon: 'error',
+						title: 'Generation Failed',
+						text: data.error
+					});
+					document.getElementById('gpg-status-text').textContent = 'Generation failed';
+					document.getElementById('gpg-status').style.background = '#ffebee';
+				} else {
+					Swal.fire({
+						icon: 'success',
+						title: 'Success',
+						text: 'GPG key generated successfully!'
+					});
+					refreshGPGStatus();
+				}
+			})
+			.catch(err => {
+				Swal.fire({
+					icon: 'error',
+					title: 'Error',
+					text: err.toString()
+				});
+				document.getElementById('gpg-status-text').textContent = 'Generation failed';
+				document.getElementById('gpg-status').style.background = '#ffebee';
+			});
+		}
+	});
+}
+
+document.getElementById('gpg_signing_enabled').addEventListener('change', updateGPGUI);
+
+document.getElementById('gpg-form').addEventListener('submit', function(e) {
+	e.preventDefault();
+	var formData = {
+		gpg_signing_enabled: document.getElementById('gpg_signing_enabled').checked,
+		gpg_key_name: document.getElementById('gpg_key_name').value,
+		gpg_key_email: document.getElementById('gpg_key_email').value,
+		gpg_key_comment: document.getElementById('gpg_key_comment').value,
+		gpg_private_key_path: document.getElementById('gpg_private_key_path').value,
+		gpg_public_key_path: document.getElementById('gpg_public_key_path').value
+	};
+	fetch('/api/console/config/update', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(formData)
+	})
+	.then(response => response.json())
+	.then(data => {
+		if (data.error) {
+			Swal.fire({
+				icon: 'error',
+				title: 'Error',
+				text: data.message || data.error
+			});
+			if (data.error === 'Unauthorized') {
+				setTimeout(function() { window.location.href = '/login'; }, 2000);
+			}
+		} else if (data.status === 'success') {
+			Swal.fire({
+				icon: 'success',
+				title: 'Saved',
+				text: 'GPG settings saved successfully!'
+			});
+			loadConfig();
+		} else {
+			Swal.fire({
+				icon: 'error',
+				title: 'Error',
+				text: 'Error saving GPG settings: ' + (data.message || 'Unknown error')
+			});
+		}
+	})
+	.catch(err => {
+		Swal.fire({
+			icon: 'error',
+			title: 'Error',
+			text: err.toString()
+		});
+	});
+});
 
 function updateSyncHoursUI() {
 	var enabled = document.getElementById('sync_allowed_hours_enabled').checked;
@@ -1471,6 +2084,7 @@ document.getElementById('config-form').addEventListener('submit', function(e) {
 		sync_interval: parseInt(document.getElementById('sync_interval').value),
 		max_disk_usage_percent: parseInt(document.getElementById('max_disk_usage_percent').value),
 		max_concurrent_downloads: parseInt(document.getElementById('max_concurrent_downloads').value),
+		database_path: document.getElementById('database_path').value.trim(),
 		sync_allowed_hours_enabled: document.getElementById('sync_allowed_hours_enabled').checked,
 		sync_allowed_hours_start: document.getElementById('sync_allowed_hours_start').value,
 		sync_allowed_hours_end: document.getElementById('sync_allowed_hours_end').value,

@@ -29,9 +29,9 @@ type EventsDB struct {
 }
 
 // NewEventsDB creates a new EventsDB instance
-func NewEventsDB(configPath string) (*EventsDB, error) {
-	dir := filepath.Dir(configPath)
-	dbPath := filepath.Join(dir, "events.db")
+// dbDir is the directory where the database file will be stored
+func NewEventsDB(dbDir string) (*EventsDB, error) {
+	dbPath := filepath.Join(dbDir, "events.db")
 
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {

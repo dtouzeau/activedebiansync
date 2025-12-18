@@ -141,7 +141,8 @@ func startDaemon() {
 	httpServer.SetAnalytics(syncer.GetAnalytics())
 
 	// Initialize security database
-	securityDB, err := database.NewSecurityDB(*configPath)
+	dbPath := cfg.GetDatabasePath()
+	securityDB, err := database.NewSecurityDB(dbPath)
 	if err != nil {
 		logger.LogError("Failed to initialize security database: %v", err)
 		logger.LogError("Security rules will be disabled")
@@ -160,7 +161,7 @@ func startDaemon() {
 	restAPI := api.NewRestAPI(cfg, logger, syncer, httpServer, pkgManager, gpgManager, syncer)
 
 	// Initialiser la base de données des mises à jour de packages
-	updatesDB, err := database.NewUpdatesDB(*configPath)
+	updatesDB, err := database.NewUpdatesDB(dbPath)
 	if err != nil {
 		logger.LogError("Failed to initialize package updates database: %v", err)
 		logger.LogError("Package update tracking will be disabled")
@@ -180,7 +181,7 @@ func startDaemon() {
 
 	// Initialiser la base de données de recherche de packages (si activée)
 	if cfgData.PackageSearchEnabled {
-		searchDB, err := database.NewPackageSearchDB(*configPath)
+		searchDB, err := database.NewPackageSearchDB(dbPath)
 		if err != nil {
 			logger.LogError("Failed to initialize package search database: %v", err)
 			logger.LogError("Package search will be disabled")
@@ -197,7 +198,7 @@ func startDaemon() {
 	}
 
 	// Initialize events database
-	eventsDB, err := database.NewEventsDB(*configPath)
+	eventsDB, err := database.NewEventsDB(dbPath)
 	if err != nil {
 		logger.LogError("Failed to initialize events database: %v", err)
 		logger.LogError("Sync event tracking will be disabled")
@@ -212,7 +213,7 @@ func startDaemon() {
 	}
 
 	// Initialize clients database for tracking client access statistics
-	clientsDB, err := database.NewClientsDB(*configPath)
+	clientsDB, err := database.NewClientsDB(dbPath)
 	if err != nil {
 		logger.LogError("Failed to initialize clients database: %v", err)
 		logger.LogError("Client statistics tracking will be disabled")
@@ -238,7 +239,7 @@ func startDaemon() {
 	var replicationMgr *cluster.ReplicationManager
 	if cfgData.ClusterEnabled {
 		var err error
-		clusterDB, err = database.NewClusterDB(*configPath)
+		clusterDB, err = database.NewClusterDB(dbPath)
 		if err != nil {
 			logger.LogError("Failed to initialize cluster database: %v", err)
 			logger.LogError("Cluster replication will be disabled")
@@ -376,7 +377,7 @@ func startDaemon() {
 	var webConsole *webconsole.WebConsole
 	if cfgData.WebConsoleEnabled {
 		var err error
-		webConsole, err = webconsole.NewWebConsole(cfg, *configPath, logger)
+		webConsole, err = webconsole.NewWebConsole(cfg, *configPath, logger, version)
 		if err != nil {
 			logger.LogError("Failed to initialize web console: %v", err)
 			logger.LogError("Web console will be disabled")

@@ -35,10 +35,9 @@ type UpdatesDB struct {
 }
 
 // NewUpdatesDB crée une nouvelle instance de UpdatesDB
-// configPath est le chemin vers le fichier de configuration
-func NewUpdatesDB(configPath string) (*UpdatesDB, error) {
-	dir := filepath.Dir(configPath)
-	dbPath := filepath.Join(dir, "package_updates.db")
+// dbDir is the directory where the database file will be stored
+func NewUpdatesDB(dbDir string) (*UpdatesDB, error) {
+	dbPath := filepath.Join(dbDir, "package_updates.db")
 
 	// Vérifier si c'est la première synchronisation (DB n'existe pas)
 	isFirstSync := false

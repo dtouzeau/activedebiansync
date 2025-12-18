@@ -24,39 +24,39 @@ const (
 
 // SecurityRule represents an access control rule
 type SecurityRule struct {
-	ID              int64            `json:"id"`
-	Name            string           `json:"name"`
-	Type            SecurityRuleType `json:"type"`              // allow, deny, limit
-	Priority        int              `json:"priority"`          // Higher priority = evaluated first
-	Enabled         bool             `json:"enabled"`           // Rule is active
-	IPAddress       string           `json:"ip_address"`        // Single IP, CIDR, or empty for any
-	UserAgentMatch  string           `json:"user_agent_match"`  // Regex pattern or empty for any
-	BandwidthLimit  int64            `json:"bandwidth_limit"`   // Bytes per second (0 = unlimited)
-	ApplyToHTTP     bool             `json:"apply_to_http"`     // Apply to HTTP port
-	ApplyToHTTPS    bool             `json:"apply_to_https"`    // Apply to HTTPS port
-	Description     string           `json:"description"`       // Human-readable description
-	HitCount        int64            `json:"hit_count"`         // Number of times rule was matched
-	LastHit         *time.Time       `json:"last_hit"`          // Last time rule was matched
-	CreatedAt       time.Time        `json:"created_at"`
-	UpdatedAt       time.Time        `json:"updated_at"`
+	ID             int64            `json:"id"`
+	Name           string           `json:"name"`
+	Type           SecurityRuleType `json:"type"`             // allow, deny, limit
+	Priority       int              `json:"priority"`         // Higher priority = evaluated first
+	Enabled        bool             `json:"enabled"`          // Rule is active
+	IPAddress      string           `json:"ip_address"`       // Single IP, CIDR, or empty for any
+	UserAgentMatch string           `json:"user_agent_match"` // Regex pattern or empty for any
+	BandwidthLimit int64            `json:"bandwidth_limit"`  // Bytes per second (0 = unlimited)
+	ApplyToHTTP    bool             `json:"apply_to_http"`    // Apply to HTTP port
+	ApplyToHTTPS   bool             `json:"apply_to_https"`   // Apply to HTTPS port
+	Description    string           `json:"description"`      // Human-readable description
+	HitCount       int64            `json:"hit_count"`        // Number of times rule was matched
+	LastHit        *time.Time       `json:"last_hit"`         // Last time rule was matched
+	CreatedAt      time.Time        `json:"created_at"`
+	UpdatedAt      time.Time        `json:"updated_at"`
 	// Compiled fields (not stored in DB)
-	compiledCIDR    *net.IPNet       `json:"-"`
-	compiledUA      *regexp.Regexp   `json:"-"`
+	compiledCIDR *net.IPNet     `json:"-"`
+	compiledUA   *regexp.Regexp `json:"-"`
 }
 
 // SecurityDB manages security rules
 type SecurityDB struct {
-	db       *sql.DB
-	dbPath   string
-	rules    []SecurityRule // Cached rules sorted by priority
-	mu       sync.RWMutex
-	cacheMu  sync.RWMutex
+	db      *sql.DB
+	dbPath  string
+	rules   []SecurityRule // Cached rules sorted by priority
+	mu      sync.RWMutex
+	cacheMu sync.RWMutex
 }
 
 // NewSecurityDB creates a new SecurityDB instance
-func NewSecurityDB(configPath string) (*SecurityDB, error) {
-	dir := filepath.Dir(configPath)
-	dbPath := filepath.Join(dir, "security.db")
+// dbDir is the directory where the database file will be stored
+func NewSecurityDB(dbDir string) (*SecurityDB, error) {
+	dbPath := filepath.Join(dbDir, "security.db")
 
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
@@ -211,7 +211,7 @@ func (s *SecurityDB) parseCIDR(ipStr string) *net.IPNet {
 type MatchResult struct {
 	Allowed        bool
 	Denied         bool
-	BandwidthLimit int64  // 0 = unlimited
+	BandwidthLimit int64 // 0 = unlimited
 	MatchedRule    *SecurityRule
 	Reason         string
 }

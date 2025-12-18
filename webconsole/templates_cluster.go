@@ -64,7 +64,12 @@ func (wc *WebConsole) renderCluster(w http.ResponseWriter, r *http.Request, sess
 <div id="replication-progress-card" class="card" style="margin-bottom:20px;display:none">
 	<div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
 		<span><i class="material-icons" style="vertical-align:middle;margin-right:5px">sync</i> Replication in Progress</span>
-		<span id="replication-peer" class="label label-primary"></span>
+		<div style="display:flex;align-items:center;gap:10px">
+			<span id="replication-peer" class="label label-primary"></span>
+			<button id="stop-replication-btn" class="btn btn-danger btn-sm" onclick="stopReplication()" style="padding:4px 12px">
+				<i class="material-icons" style="font-size:16px;vertical-align:middle">stop</i> Stop
+			</button>
+		</div>
 	</div>
 	<div class="card-body">
 		<div style="margin-bottom:15px">
@@ -428,6 +433,34 @@ function replicateToAll() {
 			}
 		})
 		.catch(err => alert('Failed to start replication: ' + err));
+}
+
+function stopReplication() {
+	if (!confirm('Stop the current replication? This will interrupt file transfers.')) return;
+	var btn = document.getElementById('stop-replication-btn');
+	if (btn) {
+		btn.disabled = true;
+		btn.innerHTML = '<i class="material-icons" style="font-size:16px;vertical-align:middle">hourglass_empty</i> Stopping...';
+	}
+	fetch('/api/console/cluster/stop', { method: 'POST' })
+		.then(response => response.json())
+		.then(data => {
+			if (data.status === 'stopping') {
+				alert('Replication stop requested - will stop after current operation');
+			} else if (data.status === 'not_running') {
+				alert('No replication is currently running');
+			} else {
+				alert('Failed to stop replication: ' + (data.message || 'Unknown error'));
+			}
+			loadReplicationStatus();
+		})
+		.catch(err => {
+			alert('Failed to stop replication: ' + err);
+			if (btn) {
+				btn.disabled = false;
+				btn.innerHTML = '<i class="material-icons" style="font-size:16px;vertical-align:middle">stop</i> Stop';
+			}
+		});
 }
 
 function replicateTo(peerName) {

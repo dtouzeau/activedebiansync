@@ -850,32 +850,39 @@ func (s *Syncer) syncSuiteComponent(mirrorURL, suite, component, arch string) er
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Download Packages index files
-	targets := []string{
-		fmt.Sprintf("binary-%s/Packages.gz", arch),
-		fmt.Sprintf("binary-%s/Packages.xz", arch),
-		fmt.Sprintf("binary-%s/Release", arch),
+	successCount := 0
+
+	// Download Packages.gz with .xz fallback (generates .gz from .xz if needed)
+	packagesGzTarget := fmt.Sprintf("binary-%s/Packages.gz", arch)
+	if err := s.downloadIndexFileWithXzFallback(remoteBase, localBase, packagesGzTarget); err == nil {
+		s.logger.LogSync("Downloaded: %s/%s/%s", suite, component, packagesGzTarget)
+		successCount++
 	}
 
-	successCount := 0
-	for _, target := range targets {
-		remoteURL := fmt.Sprintf("%s/%s", remoteBase, target)
-		localPath := filepath.Join(localBase, target)
-
-		if err := s.downloadFileResume(remoteURL, localPath); err != nil {
-			// Packages.gz may not exist on security repos (only .xz), and
-			// Packages.xz may not exist on older archives. Only log at debug level.
-			// The Release file is also optional in some cases.
-			continue
-		}
-		s.logger.LogSync("Downloaded: %s/%s/%s", suite, component, target)
+	// Also try to download Packages.xz directly (some clients prefer it)
+	packagesXzTarget := fmt.Sprintf("binary-%s/Packages.xz", arch)
+	remoteURL := fmt.Sprintf("%s/%s", remoteBase, packagesXzTarget)
+	localPath := filepath.Join(localBase, packagesXzTarget)
+	if err := s.downloadFileResume(remoteURL, localPath); err == nil {
+		s.logger.LogSync("Downloaded: %s/%s/%s", suite, component, packagesXzTarget)
 		successCount++
+	}
+
+	// Download Release file (optional)
+	releaseTarget := fmt.Sprintf("binary-%s/Release", arch)
+	remoteURL = fmt.Sprintf("%s/%s", remoteBase, releaseTarget)
+	localPath = filepath.Join(localBase, releaseTarget)
+	if err := s.downloadFileResume(remoteURL, localPath); err == nil {
+		s.logger.LogSync("Downloaded: %s/%s/%s", suite, component, releaseTarget)
 	}
 
 	// We need at least one Packages file (.gz or .xz)
 	if successCount == 0 {
 		return fmt.Errorf("failed to download any index files for %s/%s/%s", suite, component, arch)
 	}
+
+	// Ensure .gz file exists (generate from .xz if missing)
+	s.ensureGzFilesFromXz(binaryDir)
 
 	return nil
 }
@@ -1148,6 +1155,11 @@ func (s *Syncer) downloadFileResumeWithValidation(url, destPath, releaseName, re
 	}
 	headResp.Body.Close()
 
+	// Check HEAD response status code - return error for 404 or other client/server errors
+	if headResp.StatusCode >= 400 {
+		return fmt.Errorf("bad status: %s", headResp.Status)
+	}
+
 	remoteSize := headResp.ContentLength
 
 	// Si le fichier local a la même taille, considérer comme déjà téléchargé
@@ -1217,6 +1229,140 @@ func (s *Syncer) downloadFileResumeWithValidation(url, destPath, releaseName, re
 			return fmt.Errorf("integrity check failed for %s", destPath)
 		} else {
 			s.logger.LogSync("Integrity check passed for %s", destPath)
+		}
+	}
+
+	return nil
+}
+
+// downloadIndexFileWithXzFallback downloads an index file with .gz -> .xz fallback
+// If the .gz file returns 404, it tries to download .xz instead and generates .gz from it
+func (s *Syncer) downloadIndexFileWithXzFallback(baseURL, localDir, filename string) error {
+	// Only apply fallback for .gz files
+	if !strings.HasSuffix(filename, ".gz") {
+		url := fmt.Sprintf("%s/%s", baseURL, filename)
+		localPath := filepath.Join(localDir, filename)
+		return s.downloadFileResume(url, localPath)
+	}
+
+	// Try .gz first
+	gzURL := fmt.Sprintf("%s/%s", baseURL, filename)
+	gzPath := filepath.Join(localDir, filename)
+
+	err := s.downloadFileResume(gzURL, gzPath)
+	if err == nil {
+		return nil // .gz downloaded successfully
+	}
+
+	// Check if it's a 404 error
+	if !strings.Contains(err.Error(), "404") {
+		return err // Different error, don't try fallback
+	}
+
+	// Try .xz fallback
+	xzFilename := strings.TrimSuffix(filename, ".gz") + ".xz"
+	xzURL := fmt.Sprintf("%s/%s", baseURL, xzFilename)
+	xzPath := filepath.Join(localDir, xzFilename)
+
+	s.logger.LogSync("Trying .xz fallback for %s (404 on .gz)", filename)
+
+	if err := s.downloadFileResume(xzURL, xzPath); err != nil {
+		return fmt.Errorf("both .gz and .xz failed: %w", err)
+	}
+
+	// Generate .gz from .xz
+	if err := s.generateGzFromXz(xzPath, gzPath); err != nil {
+		s.logger.LogError("Failed to generate .gz from .xz: %v", err)
+		// Don't fail - we still have the .xz file
+		return nil
+	}
+
+	s.logger.LogSync("Generated %s from .xz", filename)
+	return nil
+}
+
+// generateGzFromXz decompresses an .xz file and recompresses to .gz
+func (s *Syncer) generateGzFromXz(xzPath, gzPath string) error {
+	// Open the .xz file
+	xzFile, err := os.Open(xzPath)
+	if err != nil {
+		return fmt.Errorf("failed to open xz file: %w", err)
+	}
+	defer xzFile.Close()
+
+	// Create xz reader
+	xzReader, err := xz.NewReader(xzFile)
+	if err != nil {
+		return fmt.Errorf("failed to create xz reader: %w", err)
+	}
+
+	// Create the .gz file
+	gzFile, err := os.Create(gzPath)
+	if err != nil {
+		return fmt.Errorf("failed to create gz file: %w", err)
+	}
+	defer gzFile.Close()
+
+	// Create gzip writer
+	gzWriter := gzip.NewWriter(gzFile)
+	defer gzWriter.Close()
+
+	// Copy decompressed data to gzip writer
+	if _, err := io.Copy(gzWriter, xzReader); err != nil {
+		os.Remove(gzPath) // Clean up partial file
+		return fmt.Errorf("failed to transcode xz to gz: %w", err)
+	}
+
+	return nil
+}
+
+// ensureGzFilesFromXz scans a directory and generates .gz files from .xz where .gz is missing or empty
+func (s *Syncer) ensureGzFilesFromXz(dirPath string) error {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			// Recurse into subdirectories
+			subDir := filepath.Join(dirPath, entry.Name())
+			if err := s.ensureGzFilesFromXz(subDir); err != nil {
+				s.logger.LogError("Error processing %s: %v", subDir, err)
+			}
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".xz") {
+			continue
+		}
+
+		// Check if this is a Packages.xz or similar index file
+		baseName := strings.TrimSuffix(name, ".xz")
+		if baseName != "Packages" && baseName != "Sources" && !strings.HasPrefix(baseName, "Contents-") && !strings.HasPrefix(baseName, "Translation-") {
+			continue
+		}
+
+		xzPath := filepath.Join(dirPath, name)
+		gzPath := filepath.Join(dirPath, baseName+".gz")
+
+		// Check if .gz exists and has content
+		gzStat, err := os.Stat(gzPath)
+		if err == nil && gzStat.Size() > 0 {
+			continue // .gz exists and has content
+		}
+
+		// Check if .xz has content
+		xzStat, err := os.Stat(xzPath)
+		if err != nil || xzStat.Size() == 0 {
+			continue // .xz doesn't exist or is empty
+		}
+
+		// Generate .gz from .xz
+		s.logger.LogSync("Generating %s from %s", baseName+".gz", name)
+		if err := s.generateGzFromXz(xzPath, gzPath); err != nil {
+			s.logger.LogError("Failed to generate %s: %v", gzPath, err)
 		}
 	}
 
@@ -3015,40 +3161,41 @@ func (s *Syncer) syncUbuntuReleaseComponent(releaseConfig config.UbuntuReleaseCo
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Download Packages index files
-	targets := []string{
-		fmt.Sprintf("binary-%s/Packages.gz", arch),
-		fmt.Sprintf("binary-%s/Packages.xz", arch),
-		fmt.Sprintf("binary-%s/Release", arch),
-	}
-
-	var jobs []DownloadJob
-	for _, target := range targets {
-		relativePath := fmt.Sprintf("%s/%s", component, target)
-		jobs = append(jobs, DownloadJob{
-			URL:          fmt.Sprintf("%s/%s", remoteBase, target),
-			LocalPath:    filepath.Join(localBase, target),
-			ReleaseName:  releaseName,
-			RelativePath: relativePath,
-		})
-	}
-
-	results := s.downloadFilesParallel(jobs)
-
 	successCount := 0
-	for _, result := range results {
-		if result.Error != nil {
-			// Don't log errors for optional files
-			continue
-		}
-		s.logger.LogSync("Downloaded Ubuntu: %s/%s/%s", releaseName, component, arch)
+
+	// Download Packages.gz with .xz fallback (generates .gz from .xz if needed)
+	packagesGzTarget := fmt.Sprintf("binary-%s/Packages.gz", arch)
+	if err := s.downloadIndexFileWithXzFallback(remoteBase, localBase, packagesGzTarget); err == nil {
+		s.logger.LogSync("Downloaded Ubuntu: %s/%s/%s", releaseName, component, packagesGzTarget)
 		atomic.AddInt64(&s.stats.TotalFiles, 1)
 		successCount++
+	}
+
+	// Also try to download Packages.xz directly (some clients prefer it)
+	packagesXzTarget := fmt.Sprintf("binary-%s/Packages.xz", arch)
+	remoteURL := fmt.Sprintf("%s/%s", remoteBase, packagesXzTarget)
+	localPath := filepath.Join(localBase, packagesXzTarget)
+	if err := s.downloadFileResume(remoteURL, localPath); err == nil {
+		s.logger.LogSync("Downloaded Ubuntu: %s/%s/%s", releaseName, component, packagesXzTarget)
+		atomic.AddInt64(&s.stats.TotalFiles, 1)
+		successCount++
+	}
+
+	// Download Release file (optional)
+	releaseTarget := fmt.Sprintf("binary-%s/Release", arch)
+	remoteURL = fmt.Sprintf("%s/%s", remoteBase, releaseTarget)
+	localPath = filepath.Join(localBase, releaseTarget)
+	if err := s.downloadFileResume(remoteURL, localPath); err == nil {
+		s.logger.LogSync("Downloaded Ubuntu: %s/%s/%s", releaseName, component, releaseTarget)
+		atomic.AddInt64(&s.stats.TotalFiles, 1)
 	}
 
 	if successCount == 0 {
 		return fmt.Errorf("failed to download any index files for Ubuntu %s/%s/%s", releaseName, component, arch)
 	}
+
+	// Ensure .gz file exists (generate from .xz if missing)
+	s.ensureGzFilesFromXz(binaryDir)
 
 	return nil
 }
@@ -3293,28 +3440,38 @@ func (s *Syncer) syncUbuntuPocketComponent(mirrorURL, pocket, component, arch st
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Download Packages index files
-	targets := []string{
-		fmt.Sprintf("binary-%s/Packages.gz", arch),
-		fmt.Sprintf("binary-%s/Packages.xz", arch),
-		fmt.Sprintf("binary-%s/Release", arch),
+	successCount := 0
+
+	// Download Packages.gz with .xz fallback (generates .gz from .xz if needed)
+	packagesGzTarget := fmt.Sprintf("binary-%s/Packages.gz", arch)
+	if err := s.downloadIndexFileWithXzFallback(remoteBase, localBase, packagesGzTarget); err == nil {
+		s.logger.LogSync("Downloaded Ubuntu pocket: %s/%s/%s", pocket, component, packagesGzTarget)
+		successCount++
 	}
 
-	successCount := 0
-	for _, target := range targets {
-		remoteURL := fmt.Sprintf("%s/%s", remoteBase, target)
-		localPath := filepath.Join(localBase, target)
-
-		if err := s.downloadFileResume(remoteURL, localPath); err != nil {
-			continue
-		}
-		s.logger.LogSync("Downloaded Ubuntu pocket: %s/%s/%s", pocket, component, target)
+	// Also try to download Packages.xz directly (some clients prefer it)
+	packagesXzTarget := fmt.Sprintf("binary-%s/Packages.xz", arch)
+	remoteURL := fmt.Sprintf("%s/%s", remoteBase, packagesXzTarget)
+	localPath := filepath.Join(localBase, packagesXzTarget)
+	if err := s.downloadFileResume(remoteURL, localPath); err == nil {
+		s.logger.LogSync("Downloaded Ubuntu pocket: %s/%s/%s", pocket, component, packagesXzTarget)
 		successCount++
+	}
+
+	// Download Release file (optional)
+	releaseTarget := fmt.Sprintf("binary-%s/Release", arch)
+	remoteURL = fmt.Sprintf("%s/%s", remoteBase, releaseTarget)
+	localPath = filepath.Join(localBase, releaseTarget)
+	if err := s.downloadFileResume(remoteURL, localPath); err == nil {
+		s.logger.LogSync("Downloaded Ubuntu pocket: %s/%s/%s", pocket, component, releaseTarget)
 	}
 
 	if successCount == 0 {
 		return fmt.Errorf("failed to download any index files for Ubuntu pocket %s/%s/%s", pocket, component, arch)
 	}
+
+	// Ensure .gz file exists (generate from .xz if missing)
+	s.ensureGzFilesFromXz(binaryDir)
 
 	return nil
 }

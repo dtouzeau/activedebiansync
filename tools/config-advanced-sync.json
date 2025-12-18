@@ -1,17 +1,10 @@
 {
   "sync_interval": 180,
-  "sync_packages": true,
   "repository_path": "/var/lib/ActiveDebianSync/mirror",
   "debian_mirror": "http://deb.debian.org/debian",
   "debian_releases": ["bookworm"],
   "debian_architectures": ["amd64"],
   "debian_components": ["main", "contrib", "non-free", "non-free-firmware"],
-  "sync_debian_installer": false,
-  "sync_installer_udebs": false,
-  "sync_installer_images": false,
-  "installer_image_types": ["netboot", "hd-media", "cdrom"],
-  "sync_translations": true,
-  "translation_languages": ["en", "fr", "de", "es"],
   "max_concurrent_downloads": 8,
   "download_bandwidth_limit": 5000,
   "block_clients_during_sync": true,
@@ -22,18 +15,6 @@
   "http_port": 8080,
   "https_enabled": false,
   "https_port": 8443,
-  "web_console_enabled": false,
-  "web_console_port": 8090,
-  "web_console_listen_addr": "0.0.0.0",
-  "web_console_base_path": "",
-  "web_console_trusted_proxies": "127.0.0.1",
-  "web_console_secure_cookies": true,
-  "cve_scanner_enabled": false,
-  "cve_scan_after_sync": true,
-  "cve_cache_expiry_hours": 6,
-  "cve_nvd_enabled": false,
-  "cve_nvd_api_key": "",
-  "cve_osv_enabled": true,
   "tls_cert_file": "/etc/ActiveDebianSync/server.crt",
   "tls_key_file": "/etc/ActiveDebianSync/server.key",
   "api_enabled": true,
@@ -45,47 +26,5 @@
   "access_log_path": "/var/log/ActiveDebianSync/access.log",
   "pid_file": "/var/run/activedebiansync.pid",
   "run_as_user": "debian-sync",
-  "run_as_group": "debian-sync",
-  "sync_ubuntu_repository": false,
-  "ubuntu_mirror": "http://archive.ubuntu.com/ubuntu",
-  "ubuntu_releases": ["jammy", "noble"],
-  "ubuntu_architectures": ["amd64"],
-  "ubuntu_components": ["main", "restricted", "universe", "multiverse"],
-  "ubuntu_release_configs": [
-    {
-      "name": "jammy",
-      "is_lts": true,
-      "sync_updates": true,
-      "sync_backports": false,
-      "sync_security": true,
-      "sync_proposed": false
-    },
-    {
-      "name": "noble",
-      "is_lts": true,
-      "sync_updates": true,
-      "sync_backports": false,
-      "sync_security": true,
-      "sync_proposed": false
-    }
-  ],
-  "cluster_enabled": false,
-  "cluster_node_name": "node1",
-  "cluster_port": 9191,
-  "cluster_auth_token": "your-secret-token",
-  "cluster_peers": [
-    {
-      "name": "node2",
-      "address": "192.168.1.102:9191",
-      "enabled": true
-    },
-    {
-      "name": "node3",
-      "address": "192.168.1.103:9191",
-      "enabled": true
-    }
-  ],
-  "cluster_auto_replicate": true,
-  "cluster_compression": "zstd",
-  "cluster_bandwidth_limit": 0
+  "run_as_group": "debian-sync"
 }

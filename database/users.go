@@ -46,9 +46,9 @@ type UsersDB struct {
 }
 
 // NewUsersDB creates a new UsersDB instance
-func NewUsersDB(configPath string) (*UsersDB, error) {
-	dir := filepath.Dir(configPath)
-	dbPath := filepath.Join(dir, "users.db")
+// dbDir is the directory where the database file will be stored
+func NewUsersDB(dbDir string) (*UsersDB, error) {
+	dbPath := filepath.Join(dbDir, "users.db")
 
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {

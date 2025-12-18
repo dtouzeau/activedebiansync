@@ -84,8 +84,9 @@ type ClusterDB struct {
 }
 
 // NewClusterDB creates a new ClusterDB instance
-func NewClusterDB(configPath string) (*ClusterDB, error) {
-	dbPath := filepath.Join(filepath.Dir(configPath), "cluster.db")
+// dbDir is the directory where the database file will be stored
+func NewClusterDB(dbDir string) (*ClusterDB, error) {
+	dbPath := filepath.Join(dbDir, "cluster.db")
 
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {

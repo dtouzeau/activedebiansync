@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/crypto/openpgp"
 	"golang.org/x/crypto/openpgp/armor"
+	"golang.org/x/crypto/openpgp/clearsign"
 	"golang.org/x/crypto/openpgp/packet"
 )
 
@@ -229,17 +230,7 @@ func (gm *GPGManager) SignReleaseFile(releaseFilePath string) error {
 	}
 	gm.logger.LogInfo("Created: %s", releaseGpgPath)
 
-	// 2. Créer InRelease (clearsign)
-	var inRelease bytes.Buffer
-	err = openpgp.ArmoredDetachSign(&inRelease, gm.privateKey, bytes.NewReader(releaseContent), &packet.Config{
-		DefaultHash: crypto.SHA256,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create inline signature: %w", err)
-	}
-
-	// Pour InRelease, on doit créer un format clearsigned
-	// Créer le fichier InRelease avec le contenu + signature
+	// 2. Créer InRelease (clearsign) - proper format for apt
 	inReleasePath := filepath.Join(filepath.Dir(releaseFilePath), "InRelease")
 	inReleaseFile, err := os.Create(inReleasePath)
 	if err != nil {
@@ -247,26 +238,29 @@ func (gm *GPGManager) SignReleaseFile(releaseFilePath string) error {
 	}
 	defer inReleaseFile.Close()
 
-	// Écrire le clearsign
-	writer, err := armor.Encode(inReleaseFile, "PGP SIGNED MESSAGE", map[string]string{
-		"Hash": "SHA256",
+	// Use clearsign.Encode to create proper clearsigned format
+	// This produces the correct format:
+	// -----BEGIN PGP SIGNED MESSAGE-----
+	// Hash: SHA256
+	//
+	// [plain text content]
+	// -----BEGIN PGP SIGNATURE-----
+	// [signature]
+	// -----END PGP SIGNATURE-----
+	clearSignWriter, err := clearsign.Encode(inReleaseFile, gm.privateKey.PrivateKey, &packet.Config{
+		DefaultHash: crypto.SHA256,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create armor writer: %w", err)
+		return fmt.Errorf("failed to create clearsign writer: %w", err)
 	}
 
-	if _, err := writer.Write(releaseContent); err != nil {
-		writer.Close()
-		return fmt.Errorf("failed to write content: %w", err)
+	if _, err := clearSignWriter.Write(releaseContent); err != nil {
+		clearSignWriter.Close()
+		return fmt.Errorf("failed to write content to InRelease: %w", err)
 	}
-	writer.Close()
 
-	// Ajouter la signature
-	if _, err := inReleaseFile.Write([]byte("\n")); err != nil {
-		return fmt.Errorf("failed to write newline: %w", err)
-	}
-	if _, err := inReleaseFile.Write(detachedSig.Bytes()); err != nil {
-		return fmt.Errorf("failed to write signature: %w", err)
+	if err := clearSignWriter.Close(); err != nil {
+		return fmt.Errorf("failed to finalize InRelease signature: %w", err)
 	}
 
 	gm.logger.LogInfo("Created: %s", inReleasePath)
@@ -338,17 +332,48 @@ func (gm *GPGManager) ExportPublicKey(outputPath string) error {
 }
 
 // GetKeyInfo retourne les informations sur la clé chargée
+// This function loads the key directly from file to get info, regardless of GPGSigningEnabled setting
 func (gm *GPGManager) GetKeyInfo() (map[string]string, error) {
-	if !gm.keyLoaded {
-		if err := gm.LoadKey(); err != nil {
-			return nil, err
+	cfg := gm.config.Get()
+
+	// Directly read and parse key file for info (don't use LoadKey which checks GPGSigningEnabled)
+	var entity *openpgp.Entity
+
+	if gm.keyLoaded && gm.privateKey != nil {
+		entity = gm.privateKey
+	} else {
+		// Try to load from file
+		if _, err := os.Stat(cfg.GPGPrivateKeyPath); os.IsNotExist(err) {
+			return nil, fmt.Errorf("private key file not found: %s", cfg.GPGPrivateKeyPath)
 		}
+
+		keyFile, err := os.Open(cfg.GPGPrivateKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open private key: %w", err)
+		}
+		defer keyFile.Close()
+
+		block, err := armor.Decode(keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode armored key: %w", err)
+		}
+
+		entityList, err := openpgp.ReadKeyRing(block.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read key ring: %w", err)
+		}
+
+		if len(entityList) == 0 {
+			return nil, fmt.Errorf("no keys found in key file")
+		}
+
+		entity = entityList[0]
 	}
 
 	info := make(map[string]string)
 
 	// Identité primaire
-	for _, ident := range gm.privateKey.Identities {
+	for _, ident := range entity.Identities {
 		info["name"] = ident.UserId.Name
 		info["email"] = ident.UserId.Email
 		info["comment"] = ident.UserId.Comment
@@ -356,14 +381,14 @@ func (gm *GPGManager) GetKeyInfo() (map[string]string, error) {
 	}
 
 	// Empreinte
-	info["fingerprint"] = fmt.Sprintf("%X", gm.privateKey.PrimaryKey.Fingerprint)
+	info["fingerprint"] = fmt.Sprintf("%X", entity.PrimaryKey.Fingerprint)
 
 	// ID de clé (derniers 8 octets de l'empreinte)
-	fingerprint := gm.privateKey.PrimaryKey.Fingerprint
+	fingerprint := entity.PrimaryKey.Fingerprint
 	info["keyid"] = fmt.Sprintf("%X", fingerprint[len(fingerprint)-8:])
 
 	// Date de création
-	info["created"] = gm.privateKey.PrimaryKey.CreationTime.Format(time.RFC3339)
+	info["created"] = entity.PrimaryKey.CreationTime.Format(time.RFC3339)
 
 	// Algorithme
 	info["algorithm"] = "RSA"

@@ -102,10 +102,12 @@ func CreateDir(directoryPath string) error {
 	}
 	return nil
 }
-func RegexGroup1(pattern *regexp.Regexp, str string) string {
-	res := pattern.FindStringSubmatch(str)
-	if len(res) < 2 {
-		return ""
+
+// RegexGroup1 extracts the first capture group from a regex match
+func RegexGroup1(re *regexp.Regexp, content string) string {
+	matches := re.FindStringSubmatch(content)
+	if len(matches) > 1 {
+		return matches[1]
 	}
-	return res[1]
+	return ""
 }

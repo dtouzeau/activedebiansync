@@ -94,7 +94,8 @@ type Config struct {
 	APIAllowedIPs []string `json:"api_allowed_ips"` // Liste d'IPs autorisées
 
 	// Paramètres de stockage
-	MaxDiskUsagePercent int `json:"max_disk_usage_percent"` // Défaut: 90%
+	MaxDiskUsagePercent int    `json:"max_disk_usage_percent"` // Défaut: 90%
+	DatabasePath        string `json:"database_path"`          // Chemin pour les bases SQLite (défaut: config dir)
 
 	// Paramètres de logging
 	LogPath       string `json:"log_path"`
@@ -389,6 +390,17 @@ func (c *Config) Get() Config {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return *c
+}
+
+// GetDatabasePath returns the configured database path or falls back to config directory
+func (c *Config) GetDatabasePath() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.DatabasePath != "" {
+		return c.DatabasePath
+	}
+	// Fall back to config directory
+	return filepath.Dir(c.ConfigPath)
 }
 
 // Update met à jour la configuration

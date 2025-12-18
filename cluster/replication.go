@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"activedebiansync/config"
@@ -19,18 +20,18 @@ import (
 
 // ReplicationStatus represents the current state of replication
 type ReplicationStatus struct {
-	Running       bool      `json:"running"`
-	CurrentPeer   string    `json:"current_peer"`
-	Direction     string    `json:"direction"` // "push" or "pull"
-	Progress      float64   `json:"progress"`  // 0-100
-	CurrentFile   string    `json:"current_file"`
-	FilesTotal    int64     `json:"files_total"`
-	FilesDone     int64     `json:"files_done"`
-	BytesTotal    int64     `json:"bytes_total"`
-	BytesDone     int64     `json:"bytes_done"`
-	StartTime     time.Time `json:"start_time"`
-	EstimatedEnd  time.Time `json:"estimated_end"`
-	ErrorMessage  string    `json:"error_message,omitempty"`
+	Running      bool      `json:"running"`
+	CurrentPeer  string    `json:"current_peer"`
+	Direction    string    `json:"direction"` // "push" or "pull"
+	Progress     float64   `json:"progress"`  // 0-100
+	CurrentFile  string    `json:"current_file"`
+	FilesTotal   int64     `json:"files_total"`
+	FilesDone    int64     `json:"files_done"`
+	BytesTotal   int64     `json:"bytes_total"`
+	BytesDone    int64     `json:"bytes_done"`
+	StartTime    time.Time `json:"start_time"`
+	EstimatedEnd time.Time `json:"estimated_end"`
+	ErrorMessage string    `json:"error_message,omitempty"`
 }
 
 // ReplicationManager handles cluster replication
@@ -39,13 +40,13 @@ type ReplicationManager struct {
 	logger    *utils.Logger
 	clusterDB *database.ClusterDB
 
-	listener   net.Listener
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	listener net.Listener
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
 
-	status     ReplicationStatus
-	statusMu   sync.RWMutex
+	status   ReplicationStatus
+	statusMu sync.RWMutex
 
 	compressor  *Compressor
 	oauthClient *OAuthClient
@@ -53,6 +54,9 @@ type ReplicationManager struct {
 	// Track active connections
 	activeConns   map[string]net.Conn
 	activeConnsMu sync.Mutex
+
+	// Stop flag for cancelling replication
+	stopRequested atomic.Bool
 }
 
 // getPeerAddress returns the peer address with port, using default port if not specified
@@ -386,11 +390,11 @@ func (rm *ReplicationManager) handlePullRequest(conn net.Conn, handshake *Handsh
 	// Update status
 	rm.statusMu.Lock()
 	rm.status = ReplicationStatus{
-		Running:    true,
+		Running:     true,
 		CurrentPeer: handshake.NodeName,
-		Direction:  "push",
-		FilesTotal: int64(len(fileReq.Files)),
-		StartTime:  startTime,
+		Direction:   "push",
+		FilesTotal:  int64(len(fileReq.Files)),
+		StartTime:   startTime,
 	}
 	rm.statusMu.Unlock()
 
@@ -407,6 +411,12 @@ func (rm *ReplicationManager) handlePullRequest(conn net.Conn, handshake *Handsh
 	var skippedLargeFiles int64
 
 	for i, filePath := range fileReq.Files {
+		// Check if stop was requested
+		if rm.IsStopping() {
+			rm.logger.LogInfo("Replication stopped by user request")
+			break
+		}
+
 		// Update status
 		rm.statusMu.Lock()
 		rm.status.FilesDone = int64(i)
@@ -600,11 +610,11 @@ func (rm *ReplicationManager) handlePushRequest(conn net.Conn, handshake *Handsh
 	// Update status
 	rm.statusMu.Lock()
 	rm.status = ReplicationStatus{
-		Running:    true,
+		Running:     true,
 		CurrentPeer: handshake.NodeName,
-		Direction:  "pull",
-		FilesTotal: int64(len(neededFiles)),
-		StartTime:  startTime,
+		Direction:   "pull",
+		FilesTotal:  int64(len(neededFiles)),
+		StartTime:   startTime,
 	}
 	rm.statusMu.Unlock()
 
@@ -734,6 +744,9 @@ func (rm *ReplicationManager) ReplicateToPeers() error {
 	if !cfg.ClusterEnabled {
 		return nil
 	}
+
+	// Reset stop flag at the start of new replication
+	rm.resetStopFlag()
 
 	rm.logger.LogInfo("Starting replication to %d peers", len(cfg.ClusterPeers))
 
@@ -980,11 +993,11 @@ func (rm *ReplicationManager) replicateToPeer(peer config.ClusterPeer) error {
 	// Update status
 	rm.statusMu.Lock()
 	rm.status = ReplicationStatus{
-		Running:    true,
+		Running:     true,
 		CurrentPeer: peer.Name,
-		Direction:  "push",
-		FilesTotal: int64(len(fileReq.Files)),
-		StartTime:  startTime,
+		Direction:   "push",
+		FilesTotal:  int64(len(fileReq.Files)),
+		StartTime:   startTime,
 	}
 	rm.statusMu.Unlock()
 
@@ -1001,6 +1014,12 @@ func (rm *ReplicationManager) replicateToPeer(peer config.ClusterPeer) error {
 	var skippedLargeFiles int64
 
 	for i, filePath := range fileReq.Files {
+		// Check if stop was requested
+		if rm.IsStopping() {
+			rm.logger.LogInfo("Pull request stopped by user request")
+			break
+		}
+
 		// Update status
 		rm.statusMu.Lock()
 		rm.status.FilesDone = int64(i)
@@ -1260,11 +1279,11 @@ func (rm *ReplicationManager) pullFromPeer(peer config.ClusterPeer) error {
 	// Update status
 	rm.statusMu.Lock()
 	rm.status = ReplicationStatus{
-		Running:    true,
+		Running:     true,
 		CurrentPeer: peer.Name,
-		Direction:  "pull",
-		FilesTotal: int64(len(neededFiles)),
-		StartTime:  startTime,
+		Direction:   "pull",
+		FilesTotal:  int64(len(neededFiles)),
+		StartTime:   startTime,
 	}
 	rm.statusMu.Unlock()
 
@@ -1378,6 +1397,42 @@ func (rm *ReplicationManager) IsRunning() bool {
 	rm.statusMu.RLock()
 	defer rm.statusMu.RUnlock()
 	return rm.status.Running
+}
+
+// IsStopping returns true if a stop has been requested
+func (rm *ReplicationManager) IsStopping() bool {
+	return rm.stopRequested.Load()
+}
+
+// StopReplication stops any running replication
+func (rm *ReplicationManager) StopReplication() error {
+	if !rm.IsRunning() {
+		return fmt.Errorf("no replication is currently running")
+	}
+
+	rm.logger.LogInfo("Stop replication requested")
+	rm.stopRequested.Store(true)
+
+	// Close all active connections to interrupt transfers
+	rm.activeConnsMu.Lock()
+	for addr, conn := range rm.activeConns {
+		rm.logger.LogInfo("Closing connection to %s", addr)
+		conn.Close()
+		delete(rm.activeConns, addr)
+	}
+	rm.activeConnsMu.Unlock()
+
+	// Update status
+	rm.statusMu.Lock()
+	rm.status.ErrorMessage = "Replication stopped by user"
+	rm.statusMu.Unlock()
+
+	return nil
+}
+
+// resetStopFlag resets the stop flag (called at start of new replication)
+func (rm *ReplicationManager) resetStopFlag() {
+	rm.stopRequested.Store(false)
 }
 
 // syncPeersToDatabase syncs configured peers to the database
